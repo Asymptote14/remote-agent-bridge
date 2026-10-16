@@ -12,6 +12,12 @@ dist/
 .workbuddy/
 *.log
 providers.json
+
+# 本机的规划/设计草稿：写的是打算做什么，而不是代码实际做了什么，
+# 发布出去会被当成现状，因此不进版本库。
+*-规划.md
+*-design-draft.md
+
 .vscode/
 .idea/
 Thumbs.db
