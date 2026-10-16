@@ -16,8 +16,12 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Serialise runs per branch, but never cancel. With cancel-in-progress: true,
+  # clicking "Re-run all jobs" creates a new attempt in the same group and
+  # cancels the very run being re-run, which is indistinguishable from a real
+  # failure in the run list and produced a confusing "cancelled" annotation.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:

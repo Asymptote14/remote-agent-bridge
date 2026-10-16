@@ -130,7 +130,16 @@ export async function startGateway({ dataDir: existingDataDir } = {}) {
     async stop({ keepDataDir = false } = {}) {
       if (child.exitCode === null) {
         child.kill();
-        await once(child, 'exit').catch(() => {});
+        // Bounded on purpose. `once('exit')` alone waits forever if the child
+        // wedges, and that turns one slow shutdown into a whole test file that
+        // never finishes, surfacing as "Promise resolution is still pending but
+        // the event loop has already resolved" with every test inside it green.
+        // The fallback timer is unref'd so it cannot hold the loop open itself.
+        const wedged = await Promise.race([
+          once(child, 'exit').then(() => false).catch(() => false),
+          new Promise(resolve => { setTimeout(() => resolve(true), 5_000).unref(); }),
+        ]);
+        if (wedged) { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
       }
       if (!keepDataDir) rmSync(dataDir, { recursive: true, force: true });
     },
