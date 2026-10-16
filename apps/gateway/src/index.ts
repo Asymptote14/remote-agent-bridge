@@ -3,7 +3,6 @@ import { WebSocketServer, WebSocket } from 'ws';
 import {
   envelope,
   type AgentProviderInfo,
-  type AgentSession,
   type Envelope,
   type SessionCreate,
   type SessionEvent,
@@ -11,19 +10,31 @@ import {
   type ConversationMessage,
   type TaskEvent,
   type TaskCreate,
-  type TaskState,
 } from '@rab/protocol';
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { getProviderConfigPath, readProviderConfigs, readRuntimeConfig, writeProviderConfigs, writeRuntimeConfig, dataDir, readSetupToken, validSetupToken, type ProviderConfig, type RuntimeConfig } from '@rab/config';
+import { codexCandidates, workBuddyCandidates } from './discovery.js';
+import { hash, valid } from './hashing.js';
+import { canTryPairing, clearPairingFailures, issuePairing, recordPairingFailure } from './pairing.js';
+import { host, port } from './runtime.js';
+import {
+  devices,
+  lastTaskEvent,
+  pairings,
+  pendingCommands,
+  pendingSessionOwners,
+  persistState,
+  publicDevice,
+  sessions,
+  tasks,
+  users,
+} from './state.js';
 
-const savedConfig = readRuntimeConfig();
-const port = Number(process.env.GATEWAY_PORT ?? savedConfig.port);
-const host = process.env.GATEWAY_HOST ?? savedConfig.host;
 const app = Fastify({ logger: true });
 let agent: WebSocket | undefined;
 let agentInfo: {
@@ -39,98 +50,10 @@ let connectionAuthenticated = false;
 /** Whether the socket holding the agent slot proved it runs on this machine. */
 let connectionLocal = false;
 
-type DeviceRecord = { name: string; platform: string; online: boolean; owner?: string; pairing?: string; auth_token_hash?: string };
-type SessionRecord = { session: AgentSession; owner: string; messages: ConversationMessage[] };
-type UserRecord = { password: string; tokenHash: string };
-type PersistedUser = { password: string; token_hash?: string; token?: string };
-type TaskRecord = {
-  owner: string;
-  session_id?: string;
-  created_at: number;
-  updated_at: number;
-  events: TaskEvent[];
-};
-type PersistedState = {
-  users: Array<[string, PersistedUser]>;
-  devices: Array<[string, DeviceRecord]>;
-  sessions: Array<[string, SessionRecord]>;
-  tasks?: Array<[string, TaskRecord]>;
-};
-const statePath = join(dataDir, 'state.json');
-const users = new Map<string, UserRecord>();
-const devices = new Map<string, DeviceRecord>();
-const pairings = new Map<string, { deviceId: string; expires: number }>();
-const pairingAttempts = new Map<string, { count: number; resetAt: number }>();
-const sessions = new Map<string, SessionRecord>();
-const pendingSessionOwners = new Map<string, string>();
-/** Session/operation responses are correlated by the envelope request_id. */
-type PendingCommand = {
-  resolve: (event: SessionEvent) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-};
-const pendingCommands = new Map<string, PendingCommand>();
-/**
- * Task records are persisted rather than held in memory only. The phone polls
- * `/api/tasks/:id/events` for a result, so losing these on restart turned every
- * in-flight task into a 404 the client could never resolve.
- */
-const tasks = new Map<string, TaskRecord>();
-const TERMINAL_TASK_STATES: TaskState[] = ['succeeded', 'failed', 'cancelled'];
-/** Terminal tasks stay readable long enough for a phone to collect the result. */
-const TASK_EVENT_TTL_MS = 24 * 60 * 60_000;
-/**
- * Backstop for a task the Agent never reports on at all — it crashed, or the
- * device was revoked mid-run. Without this the phone polls forever. The Agent
- * caps a single task at two hours, so six is comfortably past any live task.
- */
-const TASK_ABANDONED_MS = 6 * 60 * 60_000;
-/** Bound the persisted history so the state file cannot grow without limit. */
-const MAX_PERSISTED_TASKS = 200;
-const PAIRING_ATTEMPT_TTL_MS = 10 * 60_000;
-
-const lastTaskEvent = (record: TaskRecord): TaskEvent | undefined => record.events[record.events.length - 1];
-const isTaskFinished = (record: TaskRecord): boolean => {
-  const last = lastTaskEvent(record);
-  return !!last && TERMINAL_TASK_STATES.includes(last.state);
-};
-
-function sweepExpired() {
-  const now = Date.now();
-  for (const [taskId, entry] of tasks) {
-    if (isTaskFinished(entry)) {
-      // Reclaim only once the result has had time to be collected.
-      if (now - entry.updated_at > TASK_EVENT_TTL_MS) tasks.delete(taskId);
-      continue;
-    }
-    // Still in flight: never reclaim it on age alone, because its terminal
-    // event is what releases the phone's pending entry. Close it out instead if
-    // nothing has reported on it for long enough that nothing ever will.
-    if (now - entry.created_at > TASK_ABANDONED_MS) {
-      entry.events.push({
-        task_id: taskId,
-        state: 'failed',
-        message: '[task_abandoned] 超过 6 小时没有收到任何结果，判定任务已丢失（Agent 可能已退出或设备被撤销）。',
-        session_id: entry.session_id,
-      });
-      entry.events = entry.events.slice(-20);
-      entry.updated_at = now;
-    }
-  }
-  for (const [key, entry] of pairingAttempts) {
-    if (entry.resetAt < now - PAIRING_ATTEMPT_TTL_MS) pairingAttempts.delete(key);
-  }
-  for (const [code, pairing] of pairings) {
-    if (pairing.expires < now - 60_000) pairings.delete(code);
-  }
-}
-setInterval(sweepExpired, 60_000).unref();
-
 // Create the setup token eagerly so the operator (and the launcher, which reads
 // it from the data directory) can obtain it without a privileged request first.
 readSetupToken();
 
-const hash = (value: string, salt = randomBytes(16).toString('hex')) => `${salt}:${scryptSync(value, salt, 32).toString('hex')}`;
 /** Per-IP failure tracking for the login endpoint (5 failures / 5 minutes). */
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const loginLocks = new Map<string, number>();
@@ -165,84 +88,10 @@ setInterval(() => {
   for (const [key, entry] of loginAttempts) if (entry.resetAt < now) loginAttempts.delete(key);
   for (const [key, until] of loginLocks) if (until < now) loginLocks.delete(key);
 }, 60_000).unref();
-const valid = (value: string, stored: string) => {
-  const [salt, digest] = stored.split(':');
-  if (!salt || !digest || !/^[0-9a-f]+$/i.test(digest) || digest.length % 2 !== 0) return false;
-  const expected = Buffer.from(digest, 'hex');
-  const actual = scryptSync(value, salt, expected.length);
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
-};
-let stateDirty = false;
-
-if (existsSync(statePath)) {
-  try {
-    const state = JSON.parse(readFileSync(statePath, 'utf8')) as Partial<PersistedState>;
-    for (const [id, user] of state.users ?? []) {
-      const tokenHash = user.token_hash || (user.token ? hash(user.token) : '');
-      if (user.password && tokenHash) {
-        users.set(id, { password: user.password, tokenHash });
-        if (!user.token_hash) stateDirty = true;
-      }
-    }
-    for (const [id, device] of state.devices ?? []) devices.set(id, { ...device, online: false, pairing: undefined });
-    for (const [id, session] of state.sessions ?? []) sessions.set(id, { ...session, messages: session.messages ?? [] });
-    for (const [id, record] of state.tasks ?? []) {
-      if (!record || typeof record.owner !== 'string') continue;
-      const createdAt = Number(record.created_at) || Date.now();
-      tasks.set(id, {
-        owner: record.owner,
-        session_id: record.session_id,
-        created_at: createdAt,
-        updated_at: Number(record.updated_at) || createdAt,
-        events: Array.isArray(record.events) ? record.events.slice(-20) : [],
-      });
-    }
-  } catch { /* Start with an empty state if the local file is damaged. */ }
-}
-
-// A task that was still in flight when this process stopped will never be
-// reported on: the Agent's queue and its running child process live in the
-// Agent's own memory, and a restarted Agent has no idea the task existed.
-// Close these out so the phone stops polling for a result that cannot arrive.
-for (const [id, record] of tasks) {
-  if (isTaskFinished(record)) continue;
-  record.events.push({
-    task_id: id,
-    state: 'failed',
-    message: '[gateway_restart] Gateway 在任务执行期间重启，任务结果未知。',
-    session_id: record.session_id,
-  });
-  record.events = record.events.slice(-20);
-  record.updated_at = Date.now();
-  stateDirty = true;
-}
-
-function persistState() {
-  mkdirSync(dataDir, { recursive: true });
-  // Newest first, then bounded, so the persisted history stays a fixed size
-  // however long the Gateway runs.
-  const persistedTasks = [...tasks.entries()]
-    .sort(([, a], [, b]) => b.updated_at - a.updated_at)
-    .slice(0, MAX_PERSISTED_TASKS);
-  const state: PersistedState = {
-    users: [...users.entries()].map(([id, user]) => [id, { password: user.password, token_hash: user.tokenHash }]),
-    devices: [...devices.entries()].map(([id, device]) => [id, { ...device, online: false, pairing: undefined }]),
-    sessions: [...sessions.entries()],
-    tasks: persistedTasks,
-  };
-  const temporaryPath = `${statePath}.tmp`;
-  writeFileSync(temporaryPath, JSON.stringify(state, null, 2), 'utf8');
-  try { chmodSync(temporaryPath, 0o600); } catch { /* Windows may ignore POSIX file modes. */ }
-  renameSync(temporaryPath, statePath);
-}
-if (stateDirty) persistState();
 const auth = (request: { headers: Record<string, string | string[] | undefined> }) => {
   const token = String(request.headers.authorization ?? '').replace(/^Bearer /, '');
   return [...users.entries()].find(([, user]) => valid(token, user.tokenHash))?.[0];
 };
-function publicDevice(id: string, device: DeviceRecord) {
-  return { id, name: device.name, platform: device.platform, online: device.online, owner: device.owner };
-}
 const isLoopback = (request: { ip?: string }) => request.ip === '127.0.0.1' || request.ip === '::1' || request.ip === '::ffff:127.0.0.1';
 
 /**
@@ -295,76 +144,6 @@ function accessUrls(): string[] {
   return [`http://127.0.0.1:${port}`];
 }
 
-function workBuddyCandidates() {
-  const roots = [
-    process.env.WORKBUDDY_HOME,
-    'C:\\workbuddy',
-    'D:\\workbuddy',
-    'E:\\workbuddy',
-    'F:\\workbuddy',
-    'G:\\workbuddy',
-    join(process.env.LOCALAPPDATA || '', 'WorkBuddy'),
-    join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy'),
-    join(process.env.ProgramFiles || '', 'WorkBuddy'),
-  ].filter(Boolean) as string[];
-  const result: Array<{ installPath: string; executable: string; runtime: string; version?: string }> = [];
-  const seen = new Set<string>();
-  for (const root of roots) {
-    const installPath = root.replace(/[\\/]$/, '');
-    const workbuddyExe = join(installPath, 'WorkBuddy.exe');
-    const cli = join(installPath, 'resources', 'app.asar.unpacked', 'cli', 'bin', 'codebuddy');
-    if (!existsSync(cli) || seen.has(cli.toLowerCase())) continue;
-    seen.add(cli.toLowerCase());
-    const versionPath = join(installPath, 'resources', 'app.asar.unpacked', 'cli', 'package.json');
-    let version: string | undefined;
-    try {
-      const pkg = JSON.parse(readFileSync(versionPath, 'utf8')) as { publishConfig?: { customPackage?: { version?: string } }; version?: string };
-      version = pkg.publishConfig?.customPackage?.version || pkg.version;
-    } catch { /* Version is optional. */ }
-    result.push({ installPath, executable: existsSync(workbuddyExe) ? workbuddyExe : cli, runtime: process.execPath, version });
-  }
-  return result;
-}
-
-function codexCandidates() {
-  const configured = process.env.CODEX_CLI_PATH;
-  const fixedCandidates = [
-    configured,
-    join(process.env.LOCALAPPDATA || '', 'OpenAI', 'Codex', 'bin', 'codex.exe'),
-    'C:\\Program Files\\OpenAI\\Codex\\codex.exe',
-  ].filter(Boolean) as string[];
-  const versionedCandidates: string[] = [];
-  const codexBin = join(process.env.LOCALAPPDATA || '', 'OpenAI', 'Codex', 'bin');
-  try {
-    for (const entry of readdirSync(codexBin, { withFileTypes: true })) {
-      if (entry.isDirectory()) versionedCandidates.push(join(codexBin, entry.name, 'codex.exe'));
-    }
-  } catch { /* The installation directory may not exist. */ }
-  const candidates = [...fixedCandidates, ...versionedCandidates];
-  const seen = new Set<string>();
-  return candidates.filter(executable => {
-    const key = executable.toLowerCase();
-    if (seen.has(key) || !existsSync(executable)) return false;
-    seen.add(key);
-    return true;
-  }).map(executable => ({ executable, runtime: process.execPath }));
-}
-
-function issuePairing(deviceId: string): { code: string; expires_in: number } | undefined {
-  const now = Date.now();
-  for (const [code, pairing] of pairings) if (pairing.expires <= now) pairings.delete(code);
-  const device = devices.get(deviceId);
-  if (!device) return undefined;
-  if (device.pairing) pairings.delete(device.pairing);
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  device.pairing = code;
-  pairings.set(code, { deviceId, expires: Date.now() + 60_000 });
-  // The pairing code is no longer pushed over the Agent WebSocket. It stays on
-  // the Gateway until the operator fetches it from the local /setup page.
-  app.log.info({ device_id: deviceId }, 'pairing code issued (visible on local /setup page only)');
-  return { code, expires_in: 60 };
-}
-
 function originFor(request: { headers: Record<string, string | string[] | undefined> }): string {
   return String(request.headers.origin ?? '').replace(/\/$/, '');
 }
@@ -378,30 +157,6 @@ function isAllowedOrigin(request: { headers: Record<string, string | string[] | 
     (configured.length > 0 && origin === configured) ||
     origin === `http://127.0.0.1:${port}` || origin === `https://127.0.0.1:${port}` ||
     origin === `http://localhost:${port}` || origin === `https://localhost:${port}`;
-}
-
-function pairingAttemptKey(request: { ip?: string }): string {
-  return request.ip || 'unknown';
-}
-
-function canTryPairing(request: { ip?: string }): { allowed: boolean; retryAfter?: number } {
-  const now = Date.now();
-  const key = pairingAttemptKey(request);
-  const current = pairingAttempts.get(key);
-  if (!current || current.resetAt <= now) {
-    pairingAttempts.set(key, { count: 0, resetAt: now + 5 * 60_000 });
-    return { allowed: true };
-  }
-  if (current.count >= 5) return { allowed: false, retryAfter: Math.ceil((current.resetAt - now) / 1000) };
-  return { allowed: true };
-}
-
-function recordPairingFailure(request: { ip?: string }) {
-  const now = Date.now();
-  const key = pairingAttemptKey(request);
-  const current = pairingAttempts.get(key);
-  if (!current || current.resetAt <= now) pairingAttempts.set(key, { count: 1, resetAt: now + 5 * 60_000 });
-  else current.count += 1;
 }
 
 app.addHook('onRequest', async (request, reply) => {
@@ -514,7 +269,7 @@ app.post('/api/setup/pairing/renew', async (request, reply) => {
   if (!connectionAuthenticated && !connectionLocal) {
     return reply.code(409).send({ error: 'agent_not_trusted', hint: 'The connected device has not proven it runs on this machine. Restart the local Agent.' });
   }
-  return issuePairing(connectionDeviceId);
+  return issuePairing(connectionDeviceId, app.log);
 });
 
 app.post<{ Body: { email: string; password: string } }>('/api/auth/register', async (request, reply) => {
@@ -622,7 +377,7 @@ app.post<{ Body: { code: string } }>('/api/pairings/authorize', async (request, 
   const deviceToken = randomBytes(32).toString('hex');
   device.auth_token_hash = hash(deviceToken);
   pairings.delete(code);
-  pairingAttempts.delete(pairingAttemptKey(request));
+  clearPairingFailures(request);
   persistState();
   // Hand the fresh device token to the connected Agent (if any) so binding
   // survives restarts. This is the only moment the raw token is transmitted.
