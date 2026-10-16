@@ -1,0 +1,23 @@
+[
+  {
+    "id": "workbuddy",
+    "name": "WorkBuddy",
+    "adapter": "workbuddy",
+    "transport": "cli",
+    "executable": "C:\\Path\\To\\WorkBuddy.exe",
+    "runtime": "C:\\Path\\To\\node.exe",
+    "cwd": "",
+    "permissionMode": "auto",
+    "enabled": true
+  },
+  {
+    "id": "codex",
+    "name": "Codex CLI",
+    "adapter": "codex",
+    "transport": "cli",
+    "executable": "C:\\Path\\To\\codex.exe",
+    "cwd": "",
+    "sandboxMode": "read-only",
+    "enabled": false
+  }
+]

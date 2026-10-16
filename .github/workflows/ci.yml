@@ -1,0 +1,56 @@
+name: CI
+
+# Runs exactly what `pnpm test` runs locally: a TypeScript build of every
+# workspace project, then the full node:test suite. Nothing here is CI-only, so
+# a green run means a developer's machine would be green too.
+#
+# The matrix covers both platforms on purpose. The suite exercises two
+# genuinely different process-termination paths — `taskkill /T /F` on Windows
+# and process-group signals on POSIX — and the POSIX path cannot be exercised
+# on a Windows developer machine. Ubuntu is the job that actually verifies it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    # The suite boots real Gateway and Agent processes; it takes ~75s locally.
+    timeout-minutes: 20
+    strategy:
+      # One platform failing must not hide the other's result — the whole point
+      # of the matrix is seeing which platform disagrees.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # Glob patterns for `node --test` need Node 21 or newer.
+        node: ['22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Separate from the test step so a type error is not buried in test output.
+      - name: Typecheck
+        run: pnpm typecheck:tsc
+
+      - name: Test
+        run: pnpm test

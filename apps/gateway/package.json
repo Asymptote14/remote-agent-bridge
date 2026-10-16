@@ -1,0 +1,1 @@
+{"name":"@rab/gateway","version":"0.1.0","private":true,"type":"module","scripts":{"dev":"tsx watch src/index.ts","typecheck":"tsc -p tsconfig.json"},"dependencies":{"@rab/protocol":"workspace:*","@rab/config":"workspace:*","fastify":"^5.1.0","ws":"^8.18.0"},"devDependencies":{"@types/node":"^22.10.1","@types/ws":"^8.5.13","typescript":"^5.6.3","tsx":"^4.19.2"}}

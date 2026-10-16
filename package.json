@@ -1,0 +1,18 @@
+{
+  "name": "remote-agent-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @rab/gateway --filter @rab/agent dev",
+    "typecheck": "pnpm -r typecheck",
+    "typecheck:tsc": "node node_modules/typescript/bin/tsc --build --pretty false",
+    "test": "node node_modules/typescript/bin/tsc --build --pretty false && node --test \"apps/gateway/tests/*.test.mjs\" \"apps/web/tests/*.test.mjs\" \"services/agent/tests/*.test.mjs\"",
+    "start": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 start",
+    "relaunch": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 restart",
+    "setup": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 open",
+    "stop": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 stop",
+    "status": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 status"
+  },
+  "devDependencies": {"typescript": "^5.6.3", "tsx": "^4.19.2"}
+}

@@ -1,0 +1,8 @@
+# Line endings are pinned rather than left to each contributor's core.autocrlf.
+# This project's launchers are Windows batch and PowerShell files, and a batch
+# file that arrives with LF-only endings can fail on label and control flow in
+# ways that are painful to diagnose. Everything else is normalised and checked
+# out with the platform default.
+* text=auto
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
