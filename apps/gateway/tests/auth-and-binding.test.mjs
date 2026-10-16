@@ -8,7 +8,7 @@ import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { api, FakeAgent, registerUser, startGateway, waitFor } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitFor, waitForAgentSlotFree, waitForDeviceToken } from './helpers.mjs';
 
 describe('account endpoints', () => {
   let gateway;
@@ -89,8 +89,10 @@ describe('device binding lifecycle', () => {
     });
     assert.equal(authorized.status, 200);
 
-    const deviceToken = await waitFor(() => first.deviceToken, 15_000);
+    const deviceToken = await waitForDeviceToken(first);
     first.close();
+    // Release the slot before returning: callers connect another agent next.
+    await waitForAgentSlotFree(gateway);
     return { owner, first, deviceToken };
   }
 
@@ -119,7 +121,7 @@ describe('device binding lifecycle', () => {
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => seed.deviceToken, 15_000);
+    const deviceToken = await waitForDeviceToken(seed);
 
     const live = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', token: deviceToken }).connect();
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -141,7 +143,7 @@ describe('device binding lifecycle', () => {
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'holder-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => seed.deviceToken, 15_000);
+    const deviceToken = await waitForDeviceToken(seed);
 
     const live = await new FakeAgent(gateway.wsUrl, { deviceId: 'holder-2', token: deviceToken }).connect();
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -184,8 +186,14 @@ describe('device binding lifecycle', () => {
 describe('pairing codes and persistence', () => {
   let gateway;
 
-  before(async () => { gateway = await startGateway(); });
-  after(async () => { if (gateway) await gateway.stop(); });
+  // A fresh gateway per case, for the same reason as the block above: sharing
+  // one instance left the previous case's agent socket holding the single agent
+  // slot, so whether the next case was admitted depended on close timing. That
+  // raced on CI — the second case waited out its whole budget for a device
+  // token that had been handed to a socket which was already gone — while
+  // passing reliably on a fast local machine.
+  beforeEach(async () => { gateway = await startGateway(); });
+  afterEach(async () => { if (gateway) await gateway.stop(); });
 
   it('invalidates a superseded code and accepts the current one exactly once', async () => {
     const owner = await registerUser(gateway.base, 'expiry@test.local');
@@ -212,9 +220,15 @@ describe('pairing codes and persistence', () => {
     const owner = await registerUser(gateway.base, 'persist@test.local');
     const first = await new FakeAgent(gateway.wsUrl, { deviceId: 'persist-agent', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
-    await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => first.deviceToken, 15_000);
+    // Assert explicitly: letting a failed renew fall through turned this into a
+    // bare 15s "waitFor timed out" that said nothing about the actual cause.
+    assert.equal(renewed.status, 200, `pairing renew failed: ${JSON.stringify(renewed.data)}`);
+    const authorized = await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
+    assert.equal(authorized.data.authorized, true, `pairing authorize failed: ${JSON.stringify(authorized.data)}`);
+    const deviceToken = await waitForDeviceToken(first);
     first.close();
+    // The slot must be free before this test restarts and reconnects the agent.
+    await waitForAgentSlotFree(gateway);
 
     const statePath = join(gateway.dataDir, 'state.json');
     assert.ok(existsSync(statePath), 'state.json lives in the data directory');

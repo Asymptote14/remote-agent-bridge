@@ -1,6 +1,6 @@
 // Security regression tests: these lock in the behaviours added during the
 // 2026-09-17 / 2026-09-21 hardening rounds.
-import { after, before, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { api, FakeAgent, registerUser, startGateway, waitFor } from './helpers.mjs';
 
@@ -8,12 +8,17 @@ describe('gateway security surface', () => {
   let gateway;
   let token;
 
-  before(async () => {
+  // A fresh gateway per case. Two cases here connect an agent, and the Gateway
+  // holds one agent slot that is released only when it processes the previous
+  // socket's close. Sharing an instance let an earlier case's socket decide
+  // whether the next one was admitted, and a refused socket made the blindness
+  // check below pass for the wrong reason.
+  beforeEach(async () => {
     gateway = await startGateway();
     token = await registerUser(gateway.base, 'security@test.local');
   });
 
-  after(async () => {
+  afterEach(async () => {
     if (gateway) await gateway.stop();
   });
 
@@ -57,6 +62,11 @@ describe('gateway security surface', () => {
       assert.equal(session.data.error, 'agent_offline');
 
       await new Promise(resolve => setTimeout(resolve, 800));
+      // Prove the socket was actually admitted before asserting it stayed
+      // blind: a socket the gateway refused also receives nothing, so without
+      // this the check below holds whether or not the behaviour under test is
+      // intact.
+      assert.equal(agent.closed, undefined, `unbound agent was refused, not admitted: ${JSON.stringify(agent.closed)}`);
       assert.deepEqual(agent.inbound(), [], 'unbound agent received data from the gateway');
     } finally {
       agent.close();

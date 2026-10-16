@@ -2,7 +2,7 @@
 // pair -> bind -> create session -> run task -> read events.
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { api, FakeAgent, registerUser, startGateway, waitFor } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitFor, waitForDeviceToken } from './helpers.mjs';
 
 describe('pairing and task loop', () => {
   let gateway;
@@ -41,7 +41,7 @@ describe('pairing and task loop', () => {
     assert.equal(authorized.data.authorized, true);
     assert.equal(authorized.data.device.id, 'paired-agent');
 
-    const token = await waitFor(() => agent.deviceToken, 15_000);
+    const token = await waitForDeviceToken(agent);
     assert.match(token, /^[0-9a-f]{64}$/, 'agent should receive a fresh device token');
 
     // A bound agent must reconnect with the token before it can be trusted.

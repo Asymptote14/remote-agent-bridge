@@ -44,6 +44,37 @@ export async function waitFor(predicate, timeoutMs = 15_000, intervalMs = 100) {
 }
 
 /**
+ * Waits until the Gateway reports that no agent holds the single agent slot.
+ *
+ * The slot is released when the Gateway processes the previous socket's close,
+ * and that is not ordered with respect to whatever the next test does. A
+ * connection attempted while the slot is still held is refused with 1008 — and
+ * worse, a pairing code can be minted against the dying socket, so the device
+ * token is handed to nobody and the new agent waits for something that cannot
+ * arrive. Any deliberate handoff between agents must wait here first.
+ */
+export async function waitForAgentSlotFree(gateway, timeoutMs = 15_000) {
+  return waitFor(async () => {
+    const health = await api(gateway.base, '/health');
+    return health.data?.agentOnline === false ? true : undefined;
+  }, timeoutMs, 'the agent slot to be released');
+}
+
+/**
+ * Waits for an agent to receive its device token, failing fast with the close
+ * reason if the socket died first. Waiting on the token alone turns a refused
+ * or superseded connection into a bare timeout that says nothing about why,
+ * which is exactly how the shared-slot race below stayed invisible.
+ */
+export async function waitForDeviceToken(agent, timeoutMs = 15_000) {
+  return waitFor(() => {
+    if (agent.deviceToken) return agent.deviceToken;
+    if (agent.closed) throw new Error(`agent socket closed before it was bound: ${agent.closed.code} ${agent.closed.reason}`);
+    return undefined;
+  }, timeoutMs, 'the agent to receive its device token');
+}
+
+/**
  * Boots a Gateway on a free port with an isolated RAB_DATA_DIR.
  * Pass an existing `dataDir` to restart against the same state.
  */
