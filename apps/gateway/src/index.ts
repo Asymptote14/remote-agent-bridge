@@ -1,163 +1,42 @@
-import Fastify from 'fastify';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer } from 'ws';
 import {
   envelope,
   type AgentProviderInfo,
   type Envelope,
-  type SessionCreate,
   type SessionEvent,
-  type SessionSwitch,
-  type ConversationMessage,
   type TaskEvent,
-  type TaskCreate,
 } from '@rab/protocol';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
-import { networkInterfaces } from 'node:os';
-import { join } from 'node:path';
-import { getProviderConfigPath, readProviderConfigs, readRuntimeConfig, writeProviderConfigs, writeRuntimeConfig, dataDir, readSetupToken, validSetupToken, type ProviderConfig, type RuntimeConfig } from '@rab/config';
-import { codexCandidates, workBuddyCandidates } from './discovery.js';
-import { hash, valid } from './hashing.js';
-import { canTryPairing, clearPairingFailures, issuePairing, recordPairingFailure } from './pairing.js';
+import { readRuntimeConfig, readSetupToken, validSetupToken } from '@rab/config';
+import { app } from './app.js';
+import { slot } from './agent-slot.js';
+import { valid } from './hashing.js';
+import { isAllowedOrigin, originFor } from './security.js';
 import { host, port } from './runtime.js';
 import {
   devices,
-  lastTaskEvent,
-  pairings,
   pendingCommands,
   pendingSessionOwners,
   persistState,
-  publicDevice,
   sessions,
   tasks,
-  users,
 } from './state.js';
 
-const app = Fastify({ logger: true });
-let agent: WebSocket | undefined;
-let agentInfo: {
-  device_id: string;
-  platform: string;
-  interaction_mode: string;
-  capabilities: string[];
-  providers: AgentProviderInfo[];
-} | undefined;
-let connectionDeviceId: string | undefined;
-/** Whether the socket currently holding the agent slot proved its device token. */
-let connectionAuthenticated = false;
-/** Whether the socket holding the agent slot proved it runs on this machine. */
-let connectionLocal = false;
+// Each route module registers its handlers against the shared instance above.
+import './routes/pages.js';
+import './routes/setup.js';
+import './routes/auth.js';
+import './routes/providers.js';
+import './routes/devices.js';
+import './routes/sessions.js';
+import './routes/tasks.js';
+
 
 // Create the setup token eagerly so the operator (and the launcher, which reads
 // it from the data directory) can obtain it without a privileged request first.
 readSetupToken();
 
-/** Per-IP failure tracking for the login endpoint (5 failures / 5 minutes). */
-const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const loginLocks = new Map<string, number>();
-const LOGIN_MAX_FAILURES = 5;
-const LOGIN_WINDOW_MS = 5 * 60_000;
-const LOGIN_LOCK_MS = 10 * 60_000;
-
-function loginKey(request: { ip?: string }): string {
-  return request.ip || 'unknown';
-}
-function loginBlocked(request: { ip?: string }): { blocked: boolean; retryAfter?: number } {
-  const key = loginKey(request);
-  const lockedUntil = loginLocks.get(key);
-  const now = Date.now();
-  if (lockedUntil && lockedUntil > now) return { blocked: true, retryAfter: Math.ceil((lockedUntil - now) / 1000) };
-  if (lockedUntil) loginLocks.delete(key);
-  return { blocked: false };
-}
-function recordLoginFailure(request: { ip?: string }) {
-  const key = loginKey(request);
-  const now = Date.now();
-  const current = loginAttempts.get(key);
-  if (!current || current.resetAt <= now) loginAttempts.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
-  else current.count += 1;
-  if (current && current.count >= LOGIN_MAX_FAILURES) {
-    loginLocks.set(key, now + LOGIN_LOCK_MS);
-    loginAttempts.delete(key);
-  }
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of loginAttempts) if (entry.resetAt < now) loginAttempts.delete(key);
-  for (const [key, until] of loginLocks) if (until < now) loginLocks.delete(key);
-}, 60_000).unref();
-const auth = (request: { headers: Record<string, string | string[] | undefined> }) => {
-  const token = String(request.headers.authorization ?? '').replace(/^Bearer /, '');
-  return [...users.entries()].find(([, user]) => valid(token, user.tokenHash))?.[0];
-};
-const isLoopback = (request: { ip?: string }) => request.ip === '127.0.0.1' || request.ip === '::1' || request.ip === '::ffff:127.0.0.1';
-
-/**
- * Loopback alone does NOT prove locality, because the tunnel clients this
- * project supports forward to 127.0.0.1 — so every request that crosses a
- * tunnel arrives looking local. Privileged setup endpoints (pairing, provider
- * file paths, network config) additionally require the setup token, which
- * only a process that can read the data directory on this machine has.
- * Browser requests carry it in `x-rab-setup-token`; the operator can read it
- * from `<dataDir>/setup-token` or see it on the local setup page.
- */
-function requireLocalOperator(request: { ip?: string; headers: Record<string, string | string[] | undefined> }, reply: { code: (status: number) => { send: (body: unknown) => unknown } }): boolean {
-  if (!isLoopback(request)) {
-    reply.code(403).send({ error: 'setup_is_local_only' });
-    return false;
-  }
-  const presented = String(request.headers['x-rab-setup-token'] ?? '').trim();
-  if (!validSetupToken(presented)) {
-    reply.code(403).send({ error: 'setup_token_required', hint: `Open http://127.0.0.1:${port}/setup on this computer to load the setup token, or send it in the x-rab-setup-token header.` });
-    return false;
-  }
-  return true;
-}
-
-/** Loopback check only. Never a security boundary on its own — see requireLocalOperator. */
-const localOnly = isLoopback;
-
-function lanAccessUrls(): string[] {
-  const addresses = new Set<string>();
-  for (const entries of Object.values(networkInterfaces())) {
-    for (const entry of entries ?? []) {
-      if (entry.family === 'IPv4' && !entry.internal) addresses.add(`http://${entry.address}:${port}`);
-    }
-  }
-  return [...addresses].sort();
-}
-
-/** Sakura tunnel traffic crosses the public internet, so plain HTTP is never accepted. */
-const publicUrlHttpsEnforced = true;
-
-function accessUrls(): string[] {
-  const config = readRuntimeConfig();
-  if (config.networkMode === 'local') return [`http://127.0.0.1:${port}`];
-  if (config.networkMode === 'sakura' && config.publicUrl) {
-    const normalized = config.publicUrl.replace(/\/$/, '');
-    if (publicUrlHttpsEnforced && !/^https:\/\//i.test(normalized)) return [`http://127.0.0.1:${port}`];
-    return [normalized];
-  }
-  if (config.networkMode === 'lan') return lanAccessUrls();
-  return [`http://127.0.0.1:${port}`];
-}
-
-function originFor(request: { headers: Record<string, string | string[] | undefined> }): string {
-  return String(request.headers.origin ?? '').replace(/\/$/, '');
-}
-
-function isAllowedOrigin(request: { headers: Record<string, string | string[] | undefined> }): boolean {
-  const origin = originFor(request);
-  if (!origin) return true;
-  const hostHeader = String(request.headers.host ?? '').trim();
-  const configured = readRuntimeConfig().publicUrl.trim().replace(/\/$/, '');
-  return origin === `http://${hostHeader}` || origin === `https://${hostHeader}` ||
-    (configured.length > 0 && origin === configured) ||
-    origin === `http://127.0.0.1:${port}` || origin === `https://127.0.0.1:${port}` ||
-    origin === `http://localhost:${port}` || origin === `https://localhost:${port}`;
-}
 
 app.addHook('onRequest', async (request, reply) => {
   const origin = originFor(request);
@@ -179,368 +58,13 @@ app.addHook('onRequest', async (request, reply) => {
   if (request.method === 'OPTIONS') return reply.code(204).send();
 });
 
-/** Only a bound (paired) agent may receive commands or tasks. Unbound
- * connections stay blind: the plan requires they receive no data at all. */
-function isAgentBound() {
-  return Boolean(agent && agent.readyState === WebSocket.OPEN && connectionDeviceId && devices.get(connectionDeviceId)?.auth_token_hash);
-}
 
-function requireAgent(reply: { code: (status: number) => { send: (body: unknown) => unknown } }) {
-  if (!isAgentBound()) {
-    reply.code(503).send({ error: 'agent_offline' });
-    return false;
-  }
-  return true;
-}
 
-function sendSessionCommand(requestId: string, type: 'session.create' | 'session.switch', payload: SessionCreate | SessionSwitch): Promise<SessionEvent> {
-  return new Promise((resolve, reject) => {
-    if (!isAgentBound()) {
-      reject(new Error('agent_offline'));
-      return;
-    }
-    const timer = setTimeout(() => {
-      pendingCommands.delete(requestId);
-      reject(new Error('session_operation_timeout'));
-    }, 5_000);
-    pendingCommands.set(requestId, { resolve, reject, timer });
-    agent!.send(JSON.stringify(envelope(type, payload, requestId)));
-  });
-}
 
-app.get('/health', async () => ({
-  ok: true,
-  agentOnline: agent?.readyState === WebSocket.OPEN,
-  agent: agentInfo,
-  sessions: sessions.size,
-}));
 
-app.get('/', async (_request, reply) => {
-  const html = await readFile(join(process.cwd(), 'apps', 'web', 'index.html'), 'utf8');
-  return reply.type('text/html; charset=utf-8').send(html);
-});
-app.get('/setup', async (_request, reply) => {
-  const html = await readFile(join(process.cwd(), 'apps', 'web', 'setup.html'), 'utf8');
-  return reply.type('text/html; charset=utf-8').send(html);
-});
-app.get('/api/setup/status', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  const device = connectionDeviceId ? devices.get(connectionDeviceId) : undefined;
-  const pairing = device?.pairing ? pairings.get(device.pairing) : undefined;
-  return {
-    config: { ...readRuntimeConfig(), port, host },
-    gateway: { host, port, url: accessUrls()[0] ?? `http://127.0.0.1:${port}`, access_urls: accessUrls(), public_url_https_enforced: publicUrlHttpsEnforced },
-    warnings: readRuntimeConfig().networkMode === 'sakura' && readRuntimeConfig().publicUrl && !/^https:\/\//i.test(readRuntimeConfig().publicUrl.replace(/\/$/, ''))
-      ? ['sakura_public_url_must_use_https']
-      : [],
-    provider_config: { path: getProviderConfigPath(), environment_override: Boolean(process.env.RAB_PROVIDERS_FILE) },
-    agent: { online: agent?.readyState === WebSocket.OPEN, device_id: connectionDeviceId, device_name: device?.name, platform: device?.platform },
-    pairing: pairing && pairing.expires > Date.now() ? { code: device?.pairing, expires_at: pairing.expires } : undefined,
-  };
-});
-app.post<{ Body: Partial<RuntimeConfig> }>('/api/setup/config', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  const before = readRuntimeConfig();
-  const previousProviders = readProviderConfigs();
-  const submitted = request.body ?? {};
-  // Sakura tunnels relay traffic over the public internet: reject plain http:// URLs.
-  if ((submitted.networkMode ?? before.networkMode) === 'sakura' && typeof submitted.publicUrl === 'string' && submitted.publicUrl.trim() && !/^https:\/\//i.test(submitted.publicUrl.trim())) {
-    return reply.code(400).send({ error: 'sakura_public_url_must_use_https' });
-  }
-  const next = writeRuntimeConfig(submitted);
-  if (next.providersFile !== before.providersFile && !existsSync(next.providersFile)) {
-    mkdirSync(join(next.providersFile, '..'), { recursive: true });
-    writeFileSync(next.providersFile, JSON.stringify(previousProviders, null, 2), { encoding: 'utf8', mode: 0o600 });
-    try { chmodSync(next.providersFile, 0o600); } catch { /* Windows may ignore POSIX file modes. */ }
-  }
-  if (connectionDeviceId) {
-    const device = devices.get(connectionDeviceId);
-    if (device) device.name = next.deviceName;
-  }
-  return { saved: true, restart_required: next.host !== host || next.port !== port || next.providersFile !== before.providersFile, config: next };
-});
-app.post('/api/setup/pairing/renew', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  if (!agent || agent.readyState !== WebSocket.OPEN || !connectionDeviceId) return reply.code(503).send({ error: 'agent_offline' });
-  // Only ever mint a code for a device that is either already authenticated or
-  // proven to be this machine's own Agent. Otherwise a remote peer that holds
-  // the slot would receive the pairing code that the operator then authorizes,
-  // binding the operator's computer to the attacker.
-  if (!connectionAuthenticated && !connectionLocal) {
-    return reply.code(409).send({ error: 'agent_not_trusted', hint: 'The connected device has not proven it runs on this machine. Restart the local Agent.' });
-  }
-  return issuePairing(connectionDeviceId, app.log);
-});
 
-app.post<{ Body: { email: string; password: string } }>('/api/auth/register', async (request, reply) => {
-  const { email, password } = request.body ?? {};
-  if (!email || !password || password.length < 8) return reply.code(400).send({ error: 'email_and_8_char_password_required' });
-  if (users.has(email)) return reply.code(409).send({ error: 'user_exists' });
-  const token = randomBytes(32).toString('hex');
-  users.set(email, { password: hash(password), tokenHash: hash(token) });
-  persistState();
-  return { token };
-});
 
-app.post<{ Body: { email: string; password: string } }>('/api/auth/login', async (request, reply) => {
-  const blocked = loginBlocked(request);
-  if (blocked.blocked) {
-    reply.header('retry-after', String(blocked.retryAfter));
-    return reply.code(429).send({ error: 'login_rate_limited', retry_after: blocked.retryAfter });
-  }
-  const user = users.get(request.body?.email);
-  if (!user || !valid(request.body?.password ?? '', user.password)) {
-    recordLoginFailure(request);
-    return reply.code(401).send({ error: 'invalid_credentials' });
-  }
-  loginAttempts.delete(loginKey(request));
-  const token = randomBytes(32).toString('hex');
-  user.tokenHash = hash(token);
-  persistState();
-  return { token };
-});
 
-app.get('/api/providers', async (request, reply) => {
-  if (!auth(request)) return reply.code(401).send({ error: 'unauthorized' });
-  return agentInfo?.providers ?? [];
-});
-
-app.get('/api/setup/providers', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  return readProviderConfigs().map(item => ({ ...item, token: item.token ? '••••••••' : '' }));
-});
-app.get('/api/setup/workbuddy/detect', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  return { detected: workBuddyCandidates(), runtime: process.execPath };
-});
-app.get('/api/setup/codex/detect', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  return { detected: codexCandidates() };
-});
-app.post<{ Body: ProviderConfig }>('/api/setup/providers', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  const input = request.body ?? {} as ProviderConfig;
-  const transport = input.transport;
-  if (!input.id || !input.name || !['http', 'cli'].includes(transport)) return reply.code(400).send({ error: 'provider_requires_id_name_and_supported_transport' });
-  if (transport === 'http' && !input.endpoint) return reply.code(400).send({ error: 'http_provider_requires_endpoint' });
-  if (transport === 'cli' && !input.executable) return reply.code(400).send({ error: 'cli_provider_requires_executable' });
-  const items = readProviderConfigs().filter(item => item.id !== input.id);
-  const old = readProviderConfigs().find(item => item.id === input.id);
-  items.push({
-    ...old,
-    id: input.id.trim(),
-    name: input.name.trim(),
-    adapter: input.adapter?.trim() || old?.adapter || (input.id.trim() === 'workbuddy' ? 'workbuddy' : undefined),
-    transport,
-    endpoint: input.endpoint?.trim(),
-    executable: input.executable?.trim(),
-    runtime: input.runtime?.trim(),
-    cwd: input.cwd?.trim(),
-    permissionMode: input.permissionMode || 'auto',
-    sandboxMode: input.sandboxMode || old?.sandboxMode,
-    token: input.token?.replace(/^•+$/, '') || old?.token || undefined,
-    enabled: input.enabled !== false,
-  });
-  writeProviderConfigs(items);
-  return { saved: true, restart_required: true };
-});
-app.delete<{ Params: { id: string } }>('/api/setup/providers/:id', async (request, reply) => {
-  if (!requireLocalOperator(request, reply)) return;
-  writeProviderConfigs(readProviderConfigs().filter(item => item.id !== request.params.id));
-  return { deleted: true, restart_required: true };
-});
-
-app.get('/api/devices', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  return [...devices.entries()]
-    .filter(([, device]) => device.owner === user)
-    .map(([id, device]) => publicDevice(id, device));
-});
-
-app.post<{ Body: { code: string } }>('/api/pairings/authorize', async (request, reply) => {
-  const rate = canTryPairing(request);
-  if (!rate.allowed) {
-    reply.header('retry-after', String(rate.retryAfter));
-    return reply.code(429).send({ error: 'pairing_rate_limited', retry_after: rate.retryAfter });
-  }
-  const user = auth(request);
-  const code = String(request.body?.code ?? '').trim();
-  const pairing = /^\d{6}$/.test(code) ? pairings.get(code) : undefined;
-  if (!user || !pairing || pairing.expires < Date.now()) {
-    recordPairingFailure(request);
-    return reply.code(401).send({ error: 'invalid_pairing' });
-  }
-  const device = devices.get(pairing.deviceId)!;
-  device.owner = user;
-  device.pairing = undefined;
-  const deviceToken = randomBytes(32).toString('hex');
-  device.auth_token_hash = hash(deviceToken);
-  pairings.delete(code);
-  clearPairingFailures(request);
-  persistState();
-  // Hand the fresh device token to the connected Agent (if any) so binding
-  // survives restarts. This is the only moment the raw token is transmitted.
-  if (agent?.readyState === WebSocket.OPEN && connectionDeviceId === pairing.deviceId) {
-    agent.send(JSON.stringify(envelope('device.bound', { device_id: pairing.deviceId, token: deviceToken })));
-  }
-  return { authorized: true, device: publicDevice(pairing.deviceId, device) };
-});
-
-app.post<{ Params: { id: string } }>('/api/devices/:id/revoke', async (request, reply) => {
-  const user = auth(request);
-  const device = devices.get(request.params.id);
-  if (!user || !device || device.owner !== user) return reply.code(404).send({ error: 'device_not_found' });
-  device.owner = undefined;
-  device.online = false;
-  device.auth_token_hash = undefined;
-  // Drop the live Agent connection so a revoked device cannot keep using it.
-  if (agent?.readyState === WebSocket.OPEN && connectionDeviceId === request.params.id) {
-    agent.close(1008, 'device_revoked');
-    agent = undefined;
-    agentInfo = undefined;
-  }
-  persistState();
-  return { revoked: true };
-});
-
-app.get('/api/sessions', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  return [...sessions.values()]
-    .filter(record => record.owner === user)
-    .map(record => record.session)
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-});
-
-app.get<{ Params: { id: string } }>('/api/sessions/:id/messages', async (request, reply) => {
-  const user = auth(request);
-  const record = sessions.get(request.params.id);
-  if (!user || !record || record.owner !== user) return reply.code(404).send({ error: 'session_not_found' });
-  return record.messages;
-});
-
-app.delete<{ Params: { id: string } }>('/api/sessions/:id', async (request, reply) => {
-  const user = auth(request);
-  const record = sessions.get(request.params.id);
-  if (!user || !record || record.owner !== user) return reply.code(404).send({ error: 'session_not_found' });
-  sessions.delete(request.params.id);
-  pendingSessionOwners.delete(request.params.id);
-  persistState();
-  return { deleted: true };
-});
-
-app.post<{ Body: { provider_id: string; title?: string } }>('/api/sessions', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  if (!requireAgent(reply)) return;
-  const sessionId = `session_${randomUUID().slice(0, 8)}`;
-  const payload: SessionCreate = { session_id: sessionId, provider_id: request.body?.provider_id ?? 'local', title: request.body?.title };
-  pendingSessionOwners.set(sessionId, user);
-  const requestId = randomUUID();
-  try {
-    const event = await sendSessionCommand(requestId, 'session.create', payload);
-    if (event.action === 'failed' || !event.session) return reply.code(400).send({ error: event.error ?? 'session_create_failed' });
-    persistState();
-    return { session: event.session };
-  } catch (error) {
-    pendingSessionOwners.delete(sessionId);
-    return reply.code(503).send({ error: error instanceof Error ? error.message : 'session_create_failed' });
-  }
-});
-
-app.post<{ Params: { id: string }; Body: { provider_id: string } }>('/api/sessions/:id/switch', async (request, reply) => {
-  const user = auth(request);
-  const record = sessions.get(request.params.id);
-  if (!user || !record || record.owner !== user) return reply.code(404).send({ error: 'session_not_found' });
-  if (!requireAgent(reply)) return;
-  try {
-    const event = await sendSessionCommand(randomUUID(), 'session.switch', { session_id: request.params.id, provider_id: request.body?.provider_id ?? record.session.provider_id });
-    if (event.action === 'failed' || !event.session) return reply.code(400).send({ error: event.error ?? 'session_switch_failed' });
-    const existing = sessions.get(event.session.id);
-    sessions.set(event.session.id, { session: event.session, owner: user, messages: existing?.messages ?? [] });
-    persistState();
-    return { session: event.session };
-  } catch (error) {
-    return reply.code(503).send({ error: error instanceof Error ? error.message : 'session_switch_failed' });
-  }
-});
-
-app.post<{ Body: TaskCreate }>('/api/tasks', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  const task = request.body;
-  if (!task || !task.task_id || typeof task.input !== 'string') return reply.code(400).send({ error: 'task_requires_task_id_and_input' });
-
-  // Idempotency. A retried POST — page reload, flaky tunnel, double tap — must
-  // not run the work twice, and must not append the user's message to the
-  // session a second time. The check therefore comes before the session write
-  // and before the Agent is required to be online: a task that was already
-  // accepted stays accepted even if the Agent has since gone away.
-  const existing = tasks.get(task.task_id);
-  if (existing) {
-    if (existing.owner !== user) return reply.code(409).send({ error: 'task_id_conflict' });
-    const last = lastTaskEvent(existing);
-    return { accepted: true, duplicate: true, task_id: task.task_id, session_id: existing.session_id, state: last?.state ?? 'queued' };
-  }
-
-  if (!requireAgent(reply)) return;
-  if (task.session_id) {
-    const record = sessions.get(task.session_id);
-    if (!record || record.owner !== user) return reply.code(404).send({ error: 'session_not_found' });
-    if (task.provider_id && task.provider_id !== record.session.provider_id) return reply.code(400).send({ error: 'provider_session_mismatch' });
-    const userMessage: ConversationMessage = { id: randomUUID(), role: 'user', content: task.input, created_at: new Date().toISOString() };
-    record.messages.push(userMessage);
-    record.messages = record.messages.slice(-100);
-    record.session.updated_at = userMessage.created_at;
-    task.history = record.messages.slice(-20);
-  }
-  const now = Date.now();
-  tasks.set(task.task_id, { owner: user, session_id: task.session_id, created_at: now, updated_at: now, events: [] });
-  persistState();
-  agent!.send(JSON.stringify(envelope('agent.task', { ...task, mode: task.mode ?? 'isolated' })));
-  return { accepted: true, task_id: task.task_id, session_id: task.session_id };
-});
-
-/**
- * Recent task summaries for the signed-in user. The phone keeps a local list of
- * task ids it is still waiting on; this is the authoritative record it
- * reconciles against, so a task that was resolved — or lost to a restart —
- * cannot leave the client polling forever.
- */
-app.get<{ Querystring: { session_id?: string } }>('/api/tasks', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  const sessionId = request.query?.session_id;
-  return [...tasks.entries()]
-    .filter(([, record]) => record.owner === user && (!sessionId || record.session_id === sessionId))
-    // Newest activity first: a task that just finished must never be pushed out
-    // of the window by a batch of older ones, because reaching a terminal state
-    // is exactly what the client is reconciling for.
-    .sort(([, a], [, b]) => b.updated_at - a.updated_at)
-    .slice(0, 100)
-    .map(([taskId, record]) => {
-      const last = lastTaskEvent(record);
-      return {
-        task_id: taskId,
-        state: last?.state ?? 'queued',
-        message: last?.message ?? '',
-        session_id: record.session_id,
-        created_at: record.created_at,
-        updated_at: record.updated_at,
-      };
-    });
-});
-
-app.get<{ Params: { id: string } }>('/api/tasks/:id/events', async (request, reply) => {
-  const user = auth(request);
-  if (!user) return reply.code(401).send({ error: 'unauthorized' });
-  const entry = tasks.get(request.params.id);
-  if (!entry) return reply.code(404).send({ error: 'task_not_found' });
-  // Task events are only readable by the user that created the task.
-  if (entry.owner !== user) return reply.code(403).send({ error: 'forbidden' });
-  return entry.events;
-});
 
 await app.listen({ port, host });
 const wss = new WebSocketServer({ server: app.server, path: '/agent', verifyClient: (info: { origin: string; secure: boolean; req: IncomingMessage }) => {
@@ -609,23 +133,23 @@ wss.on('connection', socket => {
         // first run, and it must still be able to reclaim the slot from an
         // unauthenticated peer. An authenticated incumbent is never displaced
         // by a different device id, so one device cannot shadow another.
-        const replacesIncumbent = socketAuthenticated || (socketLocal && !connectionAuthenticated);
-        if (agent && agent.readyState === WebSocket.OPEN) {
-          const sameDevice = connectionDeviceId === hello.device_id;
+        const replacesIncumbent = socketAuthenticated || (socketLocal && !slot.authenticated);
+        if (slot.agent && slot.agent.readyState === WebSocket.OPEN) {
+          const sameDevice = slot.deviceId === hello.device_id;
           if (sameDevice || replacesIncumbent) {
-            agent.close(1000, socketAuthenticated ? 'superseded_by_reconnect' : 'superseded_by_local_agent');
+            slot.agent.close(1000, socketAuthenticated ? 'superseded_by_reconnect' : 'superseded_by_local_agent');
           } else {
             socket.close(1008, 'agent_already_connected');
             return;
           }
         }
         handshakePassed = true;
-        connectionAuthenticated = socketAuthenticated;
-        connectionLocal = socketLocal;
-        agent = socket;
+        slot.authenticated = socketAuthenticated;
+        slot.local = socketLocal;
+        slot.agent = socket;
         // Store only the fields we need. Never keep or expose the raw
         // device_token (it arrives in hello but must not leak into /health).
-        agentInfo = {
+        slot.info = {
           device_id: hello.device_id,
           platform: hello.platform,
           interaction_mode: hello.interaction_mode,
@@ -633,11 +157,11 @@ wss.on('connection', socket => {
           providers: hello.providers ?? [],
         };
         socketDeviceId = hello.device_id;
-        connectionDeviceId = hello.device_id;
+        slot.deviceId = hello.device_id;
         const device = existingDevice ?? { name: readRuntimeConfig().deviceName, platform: hello.platform, online: true };
         device.platform = hello.platform;
         device.online = true;
-        devices.set(connectionDeviceId, device);
+        devices.set(slot.deviceId, device);
         app.log.info({ device_id: hello.device_id, authenticated: socketAuthenticated }, 'agent handshake passed');
         return;
       }
@@ -692,15 +216,15 @@ wss.on('connection', socket => {
     // Only the socket that currently holds the slot may clear slot state: a
     // socket superseded by a newer one must not mark the device offline or
     // blank its successor's authorization.
-    if (agent === socket) {
-      const deviceId = socketDeviceId ?? connectionDeviceId;
+    if (slot.agent === socket) {
+      const deviceId = socketDeviceId ?? slot.deviceId;
       const device = deviceId ? devices.get(deviceId) : undefined;
       if (device) device.online = false;
-      agent = undefined;
-      agentInfo = undefined;
-      connectionDeviceId = undefined;
-      connectionAuthenticated = false;
-      connectionLocal = false;
+      slot.agent = undefined;
+      slot.info = undefined;
+      slot.deviceId = undefined;
+      slot.authenticated = false;
+      slot.local = false;
     }
     for (const [requestId, pending] of pendingCommands) {
       clearTimeout(pending.timer);
