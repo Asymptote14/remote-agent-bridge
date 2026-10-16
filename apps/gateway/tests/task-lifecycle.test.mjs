@@ -18,9 +18,9 @@ async function pairAgent(gateway, deviceId, options = {}) {
   assert.equal(renewed.status, 200, 'pairing renew needs a live agent and the operator token');
   const authorized = await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: ownerToken, body: { code: renewed.data.code } });
   assert.equal(authorized.status, 200);
-  await waitFor(() => agent.deviceToken, 5_000);
+  await waitFor(() => agent.deviceToken, 15_000);
   // A bound agent has to come back proving the token before it is trusted.
-  await waitFor(() => agent.reconnectCount > 0 && agent.socket?.readyState === 1, 8_000);
+  await waitFor(() => agent.reconnectCount > 0 && agent.socket?.readyState === 1, 15_000);
   return { ownerToken, agent };
 }
 

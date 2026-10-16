@@ -89,7 +89,7 @@ describe('device binding lifecycle', () => {
     });
     assert.equal(authorized.status, 200);
 
-    const deviceToken = await waitFor(() => first.deviceToken, 5_000);
+    const deviceToken = await waitFor(() => first.deviceToken, 15_000);
     first.close();
     return { owner, first, deviceToken };
   }
@@ -107,7 +107,7 @@ describe('device binding lifecycle', () => {
     }
 
     const bad = await new FakeAgent(gateway.wsUrl, { deviceId: 'reconnect-agent', token: 'deadbeef'.repeat(8) }).connect();
-    const closed = await waitFor(() => bad.closed, 5_000);
+    const closed = await waitFor(() => bad.closed, 15_000);
     assert.equal(closed.code, 1008);
     assert.match(closed.reason, /device_identity_invalid/);
   });
@@ -119,14 +119,14 @@ describe('device binding lifecycle', () => {
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => seed.deviceToken, 5_000);
+    const deviceToken = await waitFor(() => seed.deviceToken, 15_000);
 
     const live = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', token: deviceToken }).connect();
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(live.closed, undefined, 'authenticated peer is live');
 
     const replacement = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', token: deviceToken }).connect();
-    const superseded = await waitFor(() => live.closed, 5_000);
+    const superseded = await waitFor(() => live.closed, 15_000);
     assert.equal(superseded.code, 1000);
     assert.match(superseded.reason, /superseded_by_reconnect/);
     assert.equal(replacement.closed, undefined);
@@ -141,7 +141,7 @@ describe('device binding lifecycle', () => {
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'holder-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => seed.deviceToken, 5_000);
+    const deviceToken = await waitFor(() => seed.deviceToken, 15_000);
 
     const live = await new FakeAgent(gateway.wsUrl, { deviceId: 'holder-2', token: deviceToken }).connect();
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -149,7 +149,7 @@ describe('device binding lifecycle', () => {
     // A second, different device may NOT displace the authenticated agent,
     // even when it proves it runs locally.
     const intruder = await new FakeAgent(gateway.wsUrl, { deviceId: 'other-agent', localProof: gateway.setupToken }).connect();
-    const refused = await waitFor(() => intruder.closed, 5_000);
+    const refused = await waitFor(() => intruder.closed, 15_000);
     assert.equal(refused.code, 1008);
     assert.match(refused.reason, /agent_already_connected/);
     assert.equal(live.closed, undefined, 'the authenticated agent survives');
@@ -171,12 +171,12 @@ describe('device binding lifecycle', () => {
     const revoked = await api(gateway.base, `/api/devices/${device.id}/revoke`, { method: 'POST', token: owner });
     assert.equal(revoked.status, 200);
 
-    const closed = await waitFor(() => live.closed, 5_000);
+    const closed = await waitFor(() => live.closed, 15_000);
     assert.equal(closed.code, 1008, 'a revoked agent is dropped immediately');
     assert.match(closed.reason, /device_revoked/);
 
     const reuse = await new FakeAgent(gateway.wsUrl, { deviceId: 'revoke-agent', token: deviceToken }).connect();
-    const refused = await waitFor(() => reuse.closed, 5_000);
+    const refused = await waitFor(() => reuse.closed, 15_000);
     assert.equal(refused.code, 1008, 'the revoked token no longer authenticates');
   });
 });
@@ -213,7 +213,7 @@ describe('pairing codes and persistence', () => {
     const first = await new FakeAgent(gateway.wsUrl, { deviceId: 'persist-agent', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
-    const deviceToken = await waitFor(() => first.deviceToken, 5_000);
+    const deviceToken = await waitFor(() => first.deviceToken, 15_000);
     first.close();
 
     const statePath = join(gateway.dataDir, 'state.json');

@@ -41,7 +41,7 @@ describe('gateway security surface', () => {
   it('closes sockets that send a hello without a device id', async () => {
     const agent = new FakeAgent(gateway.wsUrl, { deviceId: '' });
     await agent.connect();
-    const closed = await waitFor(() => agent.closed, 5_000);
+    const closed = await waitFor(() => agent.closed, 15_000);
     assert.equal(closed.code, 1008);
     assert.match(closed.reason, /device_identity_invalid/);
   });

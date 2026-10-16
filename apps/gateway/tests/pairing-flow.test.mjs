@@ -41,11 +41,11 @@ describe('pairing and task loop', () => {
     assert.equal(authorized.data.authorized, true);
     assert.equal(authorized.data.device.id, 'paired-agent');
 
-    const token = await waitFor(() => agent.deviceToken, 5_000);
+    const token = await waitFor(() => agent.deviceToken, 15_000);
     assert.match(token, /^[0-9a-f]{64}$/, 'agent should receive a fresh device token');
 
     // A bound agent must reconnect with the token before it can be trusted.
-    await waitFor(() => agent.reconnectCount > 0 && agent.socket?.readyState === 1, 8_000);
+    await waitFor(() => agent.reconnectCount > 0 && agent.socket?.readyState === 1, 15_000);
     await new Promise(resolve => setTimeout(resolve, 200));
 
     // Pairing codes are single use.

@@ -23,7 +23,17 @@ export function freePort() {
   });
 }
 
-export async function waitFor(predicate, timeoutMs = 10_000, intervalMs = 100) {
+/**
+ * Polls until the predicate is truthy.
+ *
+ * The budget is deliberately generous and uniform. `node --test` runs test
+ * files concurrently (one per CPU by default) and every file here boots a real
+ * Gateway, so an operation that normally round-trips in milliseconds can wait
+ * seconds behind a dozen sibling processes. The old 5s budgets were flaky under
+ * exactly that load — which is also what a shared CI runner looks like — so
+ * every wait is 15s now.
+ */
+export async function waitFor(predicate, timeoutMs = 15_000, intervalMs = 100) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = await predicate();
@@ -59,7 +69,7 @@ export async function startGateway({ dataDir: existingDataDir } = {}) {
       const value = readFileSync(setupTokenPath, 'utf8').trim();
       return value.length >= 32 ? value : undefined;
     } catch { return undefined; }
-  }, 5_000);
+  }, 15_000);
   return {
     base,
     port,

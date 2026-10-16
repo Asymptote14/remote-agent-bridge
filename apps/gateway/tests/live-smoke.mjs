@@ -6,19 +6,25 @@ import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { freePort } from './helpers.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const dataDir = mkdtempSync(join(tmpdir(), 'rab-live-'));
-const port = 8796;
+// A hardcoded port made this fail whenever anything else held it.
+const port = await freePort();
 const base = `http://127.0.0.1:${port}`;
 const env = { ...process.env, RAB_DATA_DIR: dataDir };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Predicates may be sync or async, and may throw while the thing they wait for
+// does not exist yet: awaiting a sync predicate and calling .catch on its
+// result is what broke this script, so tolerate both shapes here.
 async function waitFor(fn, timeout = 15_000, label = 'condition') {
   const deadline = Date.now() + timeout;
   for (;;) {
-    const v = await fn().catch(() => undefined);
-    if (v) return v;
+    let value;
+    try { value = await fn(); } catch { value = undefined; }
+    if (value) return value;
     if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
     await sleep(150);
   }

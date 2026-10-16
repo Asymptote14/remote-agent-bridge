@@ -8,7 +8,7 @@
 
 默认执行模式是隔离模式：Agent 在后台队列中处理任务，不主动抢占用户当前的鼠标、键盘或前台窗口。需要 GUI 前台控制的任务会被当前版本拒绝，避免打断用户正在进行的游戏或工作。设计细节见 `docs/non-interference.md`。
 
-项目采用通用 Provider Adapter 和 Session 模型。Windows 上可在配置页自动发现 WorkBuddy，并用其自带的 CodeBuddy CLI 无头执行；CLI、HTTP、WebSocket、MCP 和 GUI Agent 也可以接入；适配器规范见 `docs/agent-adapters.md`。
+项目采用通用 Provider Adapter 和 Session 模型。当前实际实现的适配器只有四个：内置的 `local`（只读系统查询）、`http`、WorkBuddy 无头 CLI（Windows 上可在配置页自动发现 WorkBuddy，用其自带的 CodeBuddy CLI 执行）和 Codex CLI。协议里为 `websocket`、`mcp`、`gui` 预留了传输类型，但**这三种适配器尚未实现**，配置页也接不进它们。适配器规范见 `docs/agent-adapters.md`。
 
 网络访问配置见 `docs/network-access.md`。支持通过樱花内网穿透或 Tailscale/ZeroTier 等虚拟局域网访问；Gateway 会直接提供手机 Web 页面，页面会自动使用当前访问地址。会话、消息和任务记录保存在 `.rab/state.json`（任务记录保留 24 小时、最多 200 条），设备身份保存在 `.rab/agent-identity.json`。`.rab/` 统一放在工作区根目录，Gateway 和 Agent 共用同一份。同一 `task_id` 重复提交是幂等的：重复请求只返回已有结果，不会再次派发给 Agent，也不会重复写入会话消息。
 
@@ -35,14 +35,18 @@ pnpm run relaunch
 pnpm stop
 ```
 
-也可以双击根目录的 `start.cmd`、`setup.cmd`、`relaunch.cmd` 或 `stop.cmd`。这些 Windows 入口不依赖系统 PATH 中存在 `pnpm`；启动后配置页面地址是 `http://127.0.0.1:8787/setup`，可以在页面中选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
+也可以双击根目录的 `start.cmd`、`setup.cmd`、`relaunch.cmd` 或 `stop.cmd`。这些 Windows 入口不依赖系统 PATH 中存在 `pnpm`。配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**请用 `setup.cmd`（或 `pnpm setup`）打开**——它会自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
 
 本机页面：`http://127.0.0.1:8787/`；健康检查：`GET http://127.0.0.1:8787/health`
 
-发送模拟任务：
+用 API 手动发任务（可选，日常用手机页面即可）。这个接口要求登录态，并且需要一台已配对且在线的电脑；缺前者返回 401，缺后者返回 503 `agent_offline`：
 
 ```bash
-curl -X POST http://127.0.0.1:8787/api/tasks -H "content-type: application/json" -d '{"task_id":"demo-1","input":"打开浏览器","mode":"isolated"}'
+# token 来自 POST /api/auth/login 或 POST /api/auth/register 的返回
+curl -X POST http://127.0.0.1:8787/api/tasks \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer $TOKEN" \
+  -d '{"task_id":"demo-1","input":"现在几点","provider_id":"local","mode":"isolated"}'
 ```
 
 ## 测试
@@ -62,7 +66,7 @@ node --test "apps/gateway/tests/*.test.mjs" "apps/web/tests/*.test.mjs" "service
 
 CI 配置在 `.github/workflows/ci.yml`，跑的就是上面这条 `pnpm test`，没有任何 CI 专属步骤。矩阵覆盖 ubuntu 与 windows、Node 22 与 24：Windows 走 `taskkill /T /F`，Linux 走进程组信号，两条进程终止路径只能在各自的平台上验证。
 
-每个用例都会启动一个真实的 Gateway 子进程：端口自动选空闲端口，数据目录指向系统临时目录（不会读写 `.rab/`，可以和安全运行中的实例共存）。
+Gateway 的用例会各自启动一个真实的 Gateway 子进程：端口自动选空闲端口，数据目录指向系统临时目录（不会读写 `.rab/`，可以和安全运行中的实例共存）。Agent 侧的用例则真实启动子进程树，用来验证超时与取消是否真的把整棵树杀掉。
 
 带真实 Agent 的端到端冒烟（配对 → Agent 自动重连认证 → 建会话 → 跑任务）：
 
