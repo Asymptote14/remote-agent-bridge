@@ -8,7 +8,7 @@ import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { api, FakeAgent, registerUser, startGateway, waitFor, waitForAgentSlotFree, waitForDeviceToken } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitFor, waitForAgentReady, waitForAgentSlotFree, waitForDeviceToken } from './helpers.mjs';
 
 describe('account endpoints', () => {
   let gateway;
@@ -79,6 +79,9 @@ describe('device binding lifecycle', () => {
   async function pairDevice(deviceId) {
     const owner = await registerUser(gateway.base, `${deviceId}@test.local`);
     const first = await new FakeAgent(gateway.wsUrl, { deviceId, localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
+    // renew answers 503 until the Gateway has read the handshake frame, and
+    // there is no round trip here to hide that.
+    await waitForAgentReady(gateway);
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     assert.equal(renewed.status, 200, 'pairing renew needs a live agent and the operator token');
 
@@ -119,6 +122,7 @@ describe('device binding lifecycle', () => {
     // pairDevice closed the first socket; bind again for a live authenticated peer.
     const owner = await registerUser(gateway.base, 'supersede-2@test.local');
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'supersede-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
+    await waitForAgentReady(gateway);
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
     const deviceToken = await waitForDeviceToken(seed);
@@ -141,6 +145,7 @@ describe('device binding lifecycle', () => {
     await pairDevice('holder-agent');
     const owner = await registerUser(gateway.base, 'holder-2@test.local');
     const seed = await new FakeAgent(gateway.wsUrl, { deviceId: 'holder-2', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
+    await waitForAgentReady(gateway);
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: owner, body: { code: renewed.data.code } });
     const deviceToken = await waitForDeviceToken(seed);
@@ -199,6 +204,7 @@ describe('pairing codes and persistence', () => {
     const owner = await registerUser(gateway.base, 'expiry@test.local');
     const agent = await new FakeAgent(gateway.wsUrl, { deviceId: 'expiry-agent', localProof: gateway.setupToken }).connect();
     try {
+      await waitForAgentReady(gateway);
       const first = (await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken })).data.code;
       const second = (await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken })).data.code;
       assert.notEqual(first, second);
@@ -219,6 +225,10 @@ describe('pairing codes and persistence', () => {
   it('keeps device identity across a gateway restart', async () => {
     const owner = await registerUser(gateway.base, 'persist@test.local');
     const first = await new FakeAgent(gateway.wsUrl, { deviceId: 'persist-agent', localProof: gateway.setupToken, autoReconnectOnBind: false }).connect();
+    // This is the tightest call in the suite: nothing separates connect() from
+    // renew, so without this wait the Gateway can still be a poll iteration
+    // behind, answer 503, and never mint the code this test waits for.
+    await waitForAgentReady(gateway);
     const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
     // Assert explicitly: letting a failed renew fall through turned this into a
     // bare 15s "waitFor timed out" that said nothing about the actual cause.

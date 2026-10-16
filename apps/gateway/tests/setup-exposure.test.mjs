@@ -12,7 +12,7 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { api, FakeAgent, registerUser, startGateway } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitForAgentReady } from './helpers.mjs';
 
 /** A TCP proxy on loopback: the Gateway sees the peer as 127.0.0.1. */
 function startLoopbackProxy(targetPort) {
@@ -101,6 +101,9 @@ describe('setup API behind a tunnel hop', () => {
     // Issuing a code additionally requires a live, trusted Agent.
     const agent = await new FakeAgent(gateway.wsUrl, { deviceId: 'operator-agent', localProof: gateway.setupToken }).connect();
     try {
+      // renew requires connectionDeviceId, which the Gateway only sets once it
+      // has read the handshake frame.
+      await waitForAgentReady(gateway);
       const renew = await api(remote, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
       assert.equal(renew.status, 200);
       assert.match(String(renew.data.code), /^\d{6}$/);

@@ -2,7 +2,7 @@
 // pair -> bind -> create session -> run task -> read events.
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { api, FakeAgent, registerUser, startGateway, waitFor, waitForDeviceToken } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitFor, waitForAgentReady, waitForDeviceToken } from './helpers.mjs';
 
 describe('pairing and task loop', () => {
   let gateway;
@@ -15,6 +15,7 @@ describe('pairing and task loop', () => {
     ownerToken = await registerUser(gateway.base, 'owner@test.local');
     otherToken = await registerUser(gateway.base, 'intruder@test.local');
     agent = await new FakeAgent(gateway.wsUrl, { deviceId: 'paired-agent', localProof: gateway.setupToken }).connect();
+    await waitForAgentReady(gateway);
   });
 
   after(async () => {

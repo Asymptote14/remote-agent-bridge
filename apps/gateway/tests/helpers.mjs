@@ -44,6 +44,26 @@ export async function waitFor(predicate, timeoutMs = 15_000, intervalMs = 100) {
 }
 
 /**
+ * Waits until the Gateway has processed the agent's `hello`.
+ *
+ * `connect()` resolves on the client's socket `open` event, which says nothing
+ * about whether the server has read the handshake frame yet. Until it has,
+ * `connectionDeviceId` is unset and `/api/setup/pairing/renew` answers 503
+ * `agent_offline`. The two can land in the same poll iteration with no ordering
+ * guarantee, so any test that connects an agent and immediately depends on it
+ * must wait here first.
+ *
+ * Online is a sufficient signal because the Gateway sets `agent` and
+ * `connectionDeviceId` in the same synchronous block, with no await between.
+ */
+export async function waitForAgentReady(gateway, timeoutMs = 15_000) {
+  return waitFor(async () => {
+    const health = await api(gateway.base, '/health');
+    return health.data?.agentOnline === true ? true : undefined;
+  }, timeoutMs, 'the gateway to accept the agent handshake');
+}
+
+/**
  * Waits until the Gateway reports that no agent holds the single agent slot.
  *
  * The slot is released when the Gateway processes the previous socket's close,

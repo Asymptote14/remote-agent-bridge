@@ -6,7 +6,7 @@
 // treated that 404 as "not finished yet" and polled it forever.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { api, FakeAgent, registerUser, startGateway, waitFor, waitForDeviceToken } from './helpers.mjs';
+import { api, FakeAgent, registerUser, startGateway, waitFor, waitForAgentReady, waitForDeviceToken } from './helpers.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -14,6 +14,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function pairAgent(gateway, deviceId, options = {}) {
   const ownerToken = await registerUser(gateway.base, `${deviceId}@test.local`);
   const agent = await new FakeAgent(gateway.wsUrl, { deviceId, localProof: gateway.setupToken, ...options }).connect();
+  await waitForAgentReady(gateway);
   const renewed = await api(gateway.base, '/api/setup/pairing/renew', { method: 'POST', setupToken: gateway.setupToken });
   assert.equal(renewed.status, 200, 'pairing renew needs a live agent and the operator token');
   const authorized = await api(gateway.base, '/api/pairings/authorize', { method: 'POST', token: ownerToken, body: { code: renewed.data.code } });
