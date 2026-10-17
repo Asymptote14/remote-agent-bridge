@@ -27,3 +27,25 @@ describe('inline web scripts', () => {
     });
   }
 });
+
+describe('phone credential lifetime', () => {
+  const index = readFileSync(join(webRoot, 'index.html'), 'utf8');
+
+  it('keeps the account token out of localStorage so it dies with the tab', () => {
+    // Handing the phone to someone, closing the tab, or simply losing the tab to
+    // the browser must all end the session: the next visit asks for the password
+    // again. sessionStorage gives that, localStorage ("remember me") does not.
+    assert.equal(
+      /localStorage[^;]{0,80}rab_token/.test(index),
+      false,
+      'the bearer token must not be persisted in localStorage',
+    );
+    assert.match(index, /sessionStorage[^;]{0,80}rab_token/, 'the bearer token should live in sessionStorage');
+  });
+
+  it('still keeps task bookkeeping across a tab eviction', () => {
+    // The opposite requirement, and the reason the pending list exists: a task
+    // started before the phone locked must still be reconciled when it wakes.
+    assert.match(index, /localStorage[^;]{0,80}rab_pending_tasks/);
+  });
+});

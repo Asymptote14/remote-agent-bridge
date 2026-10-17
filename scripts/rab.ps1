@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('start', 'stop', 'status', 'restart', 'relaunch', 'open')]
+  [ValidateSet('start', 'stop', 'status', 'restart', 'relaunch', 'open', 'tray', 'install-tray', 'uninstall-tray')]
   [string]$Command = 'status'
 )
 
@@ -136,6 +136,65 @@ function Open-Setup {
   }
 }
 
+# --- tray control -----------------------------------------------------------
+# The tray is the convenient on-machine start/stop switch: it sits in the
+# notification area, shows whether the service is running (and whether the agent
+# is connected) without opening a browser, and starts the service only if the
+# user ticks that preference. It does NOT start on its own.
+
+function Get-TrayExecutable {
+  $builder = Join-Path $PSScriptRoot 'tray\build.ps1'
+  if (-not (Test-Path -LiteralPath $builder)) { throw "Tray builder is missing: $builder" }
+  $exe = @(& $builder -Root $Root) | Where-Object { $_ } | Select-Object -Last 1
+  if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { throw 'The tray app could not be built.' }
+  return $exe
+}
+
+function Get-TrayProcesses([string]$exe) {
+  foreach ($candidate in @(Get-Process -Name 'tray' -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $candidate.Path } catch { }
+    if ($path -eq $exe) { $candidate }
+  }
+}
+
+function Start-Tray {
+  $exe = Get-TrayExecutable
+  if (Get-TrayProcesses $exe) { Write-Host 'Tray icon is already running.'; return }
+  Start-Process -FilePath $exe -ArgumentList "--root `"$Root`"" | Out-Null
+  Write-Host 'Tray icon started. Right-click it to start or stop the service.'
+}
+
+function Install-Tray {
+  $exe = Get-TrayExecutable
+  $startup = [Environment]::GetFolderPath('Startup')
+  $link = Join-Path $startup 'Remote Agent Bridge.lnk'
+  # A Startup-folder shortcut rather than a scheduled task: it needs no
+  # elevation, and it runs in the user's session, which is required because the
+  # CLI agents keep their credentials in the user profile.
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $shell.CreateShortcut($link)
+  $shortcut.TargetPath = $exe
+  $shortcut.Arguments = "--root `"$Root`""
+  $shortcut.WorkingDirectory = $Root
+  $shortcut.Description = 'Remote Agent Bridge tray control'
+  $shortcut.Save()
+  Write-Host "Added to startup: $link"
+  Start-Tray
+}
+
+function Uninstall-Tray {
+  $startup = [Environment]::GetFolderPath('Startup')
+  $link = Join-Path $startup 'Remote Agent Bridge.lnk'
+  if (Test-Path -LiteralPath $link) { Remove-Item -LiteralPath $link -Force; Write-Host "Removed startup shortcut: $link" }
+  foreach ($process in @(Get-Process -Name 'tray' -ErrorAction SilentlyContinue)) {
+    $path = $null
+    try { $path = $process.Path } catch { }
+    if ($path -eq (Join-Path $RuntimeDir 'tray.exe')) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+  }
+  Write-Host 'Tray icon stopped.'
+}
+
 switch ($Command) {
   'start' { Start-Rab }
   'restart' { Stop-Tracked; Start-Sleep -Milliseconds 500; Start-Rab }
@@ -143,4 +202,7 @@ switch ($Command) {
   'open' { Open-Setup }
   'stop' { Stop-Tracked; Write-Host 'Remote Agent Bridge stopped.' }
   'status' { Show-Status }
+  'tray' { Start-Tray }
+  'install-tray' { Install-Tray }
+  'uninstall-tray' { Uninstall-Tray }
 }

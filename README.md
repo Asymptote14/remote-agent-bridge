@@ -35,7 +35,25 @@ pnpm run relaunch
 pnpm stop
 ```
 
-也可以双击根目录的 `start.cmd`、`setup.cmd`、`relaunch.cmd` 或 `stop.cmd`。这些 Windows 入口不依赖系统 PATH 中存在 `pnpm`。配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**请用 `setup.cmd`（或 `pnpm setup`）打开**——它会自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
+**推荐用托盘图标开关服务。** 第一次运行：
+
+```bash
+npm run install-tray
+```
+
+它会用 Windows 自带的 `csc.exe` 把 `scripts/tray/tray.cs` 编译成 `.rab/tray.exe`，并在启动文件夹放一个快捷方式。之后登录就有个圆点在通知区：
+
+- **灰色** = 已停止
+- **绿色** = 运行中，且 Agent 在线
+- **橙色** = 运行中，但 Agent 离线
+
+右键菜单：启动 / 停止 / 重启 / 打开配置页 / 开机自动启动服务。
+
+**服务不会自己启动**——托盘只负责开关，"是否随登录自动启动"由那个勾选项决定（默认关闭）。托盘本身只读 `.rab/` 下的配置和 `/health`，状态每 2 秒刷新一次。
+
+> 为什么是编译而不是提交一个 exe：仓库里不放二进制，`.rab/tray.exe` 是首次使用时从源码生成的（`.rab/` 已被 gitignore）。也因此仓库里没有需要你信任的黑盒可执行文件。
+
+不想用托盘也可以双击根目录的 `start.cmd`、`setup.cmd`、`relaunch.cmd` 或 `stop.cmd`。这些 Windows 入口不依赖系统 PATH 中存在 `pnpm`。配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**请用 `setup.cmd`（或 `pnpm setup`）打开**——它会自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
 
 本机页面：`http://127.0.0.1:8787/`；健康检查：`GET http://127.0.0.1:8787/health`
 

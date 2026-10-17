@@ -12,7 +12,10 @@
     "relaunch": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 restart",
     "setup": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 open",
     "stop": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 stop",
-    "status": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 status"
+    "status": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 status",
+    "tray": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 tray",
+    "install-tray": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 install-tray",
+    "uninstall-tray": "powershell -ExecutionPolicy Bypass -File scripts/rab.ps1 uninstall-tray"
   },
   "devDependencies": {"typescript": "^5.6.3", "tsx": "^4.19.2"}
 }
