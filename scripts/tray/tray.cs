@@ -130,6 +130,7 @@ namespace RabTray
             _menu.Items.Add(pref);
             _menu.Items.Add(new ToolStripSeparator());
             Add(_menu, Label("退出"), "quit", true);
+            Add(_menu, Label("退出并停止服务"), "quit-stop", true);
 
             _icon.Icon = !status.Running ? _iconStopped : (status.AgentOnline ? _iconRunning : _iconDegraded);
             _icon.Text = Clip(StatusText(status), 63);
@@ -145,7 +146,12 @@ namespace RabTray
         private void Add(ContextMenuStrip menu, ToolStripMenuItem item, string verb, bool enabled)
         {
             item.Enabled = enabled;
-            if (verb != null) item.Click += delegate { if (verb == "quit") Quit(); else RunScript(verb); };
+            if (verb != null) item.Click += delegate
+            {
+                if (verb == "quit") Quit();
+                else if (verb == "quit-stop") QuitAndStop();
+                else RunScript(verb);
+            };
             menu.Items.Add(item);
         }
 
@@ -260,6 +266,20 @@ namespace RabTray
             _icon.Visible = false;
             _icon.Dispose();
             ExitThread();
+        }
+
+        /// <summary>Quit, but stop the service on the way out. The stop is
+        /// fire-and-forget: the spawned PowerShell is an independent process, so
+        /// it finishes after this window is gone. Waiting on the UI thread would
+        /// freeze the tray for as long as the service takes to shut down.</summary>
+        private void QuitAndStop()
+        {
+            _icon.ShowBalloonTip(1500, "Remote Agent Bridge", "正在停止服务…", ToolTipIcon.Info);
+            RunScript("stop");
+            var exit = new Timer();
+            exit.Interval = 1500;
+            exit.Tick += delegate { exit.Stop(); exit.Dispose(); Quit(); };
+            exit.Start();
         }
 
         private static string Clip(string text, int max)
