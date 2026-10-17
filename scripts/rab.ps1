@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('start', 'stop', 'status', 'restart', 'relaunch', 'open', 'tray', 'install-tray', 'uninstall-tray')]
+  [ValidateSet('start', 'stop', 'status', 'restart', 'open', 'tray', 'install-tray', 'uninstall-tray')]
   [string]$Command = 'status'
 )
 
@@ -47,7 +47,7 @@ function Stop-Tracked {
 function Start-Rab {
   $existing = Read-State | Where-Object { $null -ne (Get-TrackedProcess $_) }
   if (@($existing).Count -gt 0) {
-    Write-Host 'Remote Agent Bridge is already running. Use setup.cmd or scripts/rab.ps1 status to inspect it.'
+    Write-Host 'Remote Agent Bridge is already running. Use the tray icon, or scripts/rab.ps1 status, to inspect it.'
     return
   }
   try {
@@ -97,7 +97,8 @@ function Start-Rab {
   )
   Write-Host 'Remote Agent Bridge started in background.'
   Write-Host 'Gateway: http://127.0.0.1:8787'
-  Write-Host 'Setup: http://127.0.0.1:8787/setup (run setup.cmd to open)'
+  Write-Host 'Setup: right-click the tray icon and choose "打开配置页", or run: npm run setup'
+  Write-Host '       (the plain /setup URL needs the token the launcher passes along)'
   Write-Host 'Logs: .rab/gateway.log, .rab/gateway-error.log, .rab/agent.log and .rab/agent-error.log'
 }
 
@@ -198,7 +199,6 @@ function Uninstall-Tray {
 switch ($Command) {
   'start' { Start-Rab }
   'restart' { Stop-Tracked; Start-Sleep -Milliseconds 500; Start-Rab }
-  'relaunch' { Stop-Tracked; Start-Sleep -Milliseconds 500; Start-Rab }
   'open' { Open-Setup }
   'stop' { Stop-Tracked; Write-Host 'Remote Agent Bridge stopped.' }
   'status' { Show-Status }

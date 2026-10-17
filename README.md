@@ -31,7 +31,7 @@ Windows 后台启动/关闭：
 pnpm start
 pnpm setup
 pnpm status
-pnpm run relaunch
+pnpm restart
 pnpm stop
 ```
 
@@ -53,7 +53,7 @@ npm run install-tray
 
 > 为什么是编译而不是提交一个 exe：仓库里不放二进制，`.rab/tray.exe` 是首次使用时从源码生成的（`.rab/` 已被 gitignore）。也因此仓库里没有需要你信任的黑盒可执行文件。
 
-不想用托盘也可以双击根目录的 `start.cmd`、`setup.cmd`、`relaunch.cmd` 或 `stop.cmd`。这些 Windows 入口不依赖系统 PATH 中存在 `pnpm`。配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**请用 `setup.cmd`（或 `pnpm setup`）打开**——它会自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
+配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**用 `pnpm setup` 或托盘菜单的「打开配置页」打开**——它会自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
 
 本机页面：`http://127.0.0.1:8787/`；健康检查：`GET http://127.0.0.1:8787/health`
 
