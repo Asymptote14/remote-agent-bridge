@@ -129,7 +129,11 @@ function Open-Setup {
     Write-Host "No setup token yet ($tokenFile). Start the service once, then run setup again."
   }
   try {
-    Start-Process $url -ErrorAction Stop | Out-Null
+    # explorer.exe hands the URL to the already-running shell instead of
+    # starting a browser as a child of this process. Without it, an elevated
+    # caller makes Windows try to open the page with an elevated browser, which
+    # Edge answers with "Microsoft Edge 未响应，因为现有实例正在以提升的权限运行".
+    Start-Process -FilePath 'explorer.exe' -ArgumentList $url -ErrorAction Stop | Out-Null
     Write-Host 'Opened setup page: http://127.0.0.1:8787/setup'
   } catch {
     Write-Host 'Service is running. Open this address manually:'
@@ -176,7 +180,10 @@ function Install-Tray {
   $shell = New-Object -ComObject WScript.Shell
   $shortcut = $shell.CreateShortcut($link)
   $shortcut.TargetPath = $exe
-  $shortcut.Arguments = "--root `"$Root`""
+  # --background: at logon the tray icon is the surface, so no window pops up in
+  # the user's face. Running `npm run tray` by hand still opens the window,
+  # because the tray icon is not guaranteed to register with the shell.
+  $shortcut.Arguments = "--root `"$Root`" --background"
   $shortcut.WorkingDirectory = $Root
   $shortcut.Description = 'Remote Agent Bridge tray control'
   $shortcut.Save()
