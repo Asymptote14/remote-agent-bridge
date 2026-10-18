@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AgentAdapter, AdapterResult, CreateSessionInput, SendMessageInput } from '@rab/adapter-sdk';
-import type { AgentProviderInfo, AgentSession } from '@rab/protocol';
+import { AdapterTaskError } from '@rab/adapter-sdk';
+import type { AgentProviderInfo, AgentSession, TaskAction } from '@rab/protocol';
 import { dataDir, type ProviderConfig } from '@rab/config';
 import { terminateProcessTree } from '../process-control.js';
 
@@ -23,7 +24,18 @@ type JsonItem = {
   output_text?: unknown;
   message?: unknown;
   result?: unknown;
+  /** Present on `command_execution` items; confirmed against real CLI output. */
+  command?: unknown;
+  exit_code?: unknown;
+  status?: unknown;
+  aggregated_output?: unknown;
 };
+
+/** Command lines and error texts are shown on a phone, not in a terminal. */
+const MAX_ACTION_DETAIL = 300;
+function clip(value: string): string {
+  return value.length <= MAX_ACTION_DETAIL ? value : `${value.slice(0, MAX_ACTION_DETAIL - 1)}…`;
+}
 
 /**
  * Runs the installed Codex CLI in non-interactive JSON mode. The adapter never
@@ -143,7 +155,43 @@ export class CodexAdapter implements AgentAdapter {
     return eventError || stderr.trim();
   }
 
-  private async run(input: SendMessageInput, externalThreadId?: string): Promise<{ message: string; externalThreadId?: string }> {
+  /**
+   * What the CLI actually did, taken from the same `item.completed` events the
+   * summary is built from. Confirmed against real `codex exec --json` output:
+   * `command_execution` items carry `command`, `exit_code` and `status`, and
+   * configuration problems arrive as `error` items.
+   *
+   * `reasoning` items are deliberately excluded: they are the model talking to
+   * itself, not an action, and they are the bulk of the stream.
+   */
+  private taskActions(events: JsonEvent[]): TaskAction[] | undefined {
+    const actions: TaskAction[] = [];
+    // Codex repeats the same configuration warning more than once per run;
+    // showing it twice on a phone is just noise.
+    const seenErrors = new Set<string>();
+    for (const event of events) {
+      if (event.type !== 'item.completed' || !event.item || typeof event.item !== 'object') continue;
+      const item = event.item as JsonItem;
+      if (item.type === 'command_execution' && typeof item.command === 'string') {
+        actions.push({
+          kind: 'command',
+          detail: clip(item.command),
+          exit_code: typeof item.exit_code === 'number' ? item.exit_code : null,
+          status: typeof item.status === 'string' ? item.status : undefined,
+        });
+      } else if (item.type === 'error') {
+        const detail = clip(this.extractText(item.message ?? item.text));
+        // Configuration warnings only make sense to the person running the CLI.
+        if (detail && !seenErrors.has(detail)) {
+          seenErrors.add(detail);
+          actions.push({ kind: 'error', detail });
+        }
+      }
+    }
+    return actions.length > 0 ? actions.slice(-50) : undefined;
+  }
+
+  private async run(input: SendMessageInput, externalThreadId?: string): Promise<{ message: string; externalThreadId?: string; actions?: TaskAction[] }> {
     const command = this.command();
     const sandbox = this.config.sandboxMode || 'read-only';
     const bypass = this.config.permissionMode === 'bypassPermissions' || sandbox === 'danger-full-access';
@@ -169,7 +217,7 @@ export class CodexAdapter implements AgentAdapter {
       let stdout = '';
       let stderr = '';
       let settled = false;
-      const finish = (error?: Error, result?: { message: string; externalThreadId?: string }) => {
+      const finish = (error?: Error, result?: { message: string; externalThreadId?: string; actions?: TaskAction[] }) => {
         if (settled) return;
         settled = true;
         this.running.delete(input.taskId);
@@ -195,9 +243,10 @@ export class CodexAdapter implements AgentAdapter {
         const thread = events.find(event => event.type === 'thread.started' && event.thread_id)?.thread_id
           || events.find(event => event.thread_id)?.thread_id;
         const message = this.completedMessage(events) || this.extractText(events[events.length - 1]?.result);
-        if (code !== 0) finish(new Error(this.errorText(events, stderr) || `codex_exit_${code}`));
-        else if (!message) finish(new Error(this.errorText(events, stderr) || 'codex_empty_response'));
-        else finish(undefined, { message, externalThreadId: thread });
+        const actions = this.taskActions(events);
+        if (code !== 0) finish(new AdapterTaskError(this.errorText(events, stderr) || `codex_exit_${code}`, actions));
+        else if (!message) finish(new AdapterTaskError(this.errorText(events, stderr) || 'codex_empty_response', actions));
+        else finish(undefined, { message, externalThreadId: thread, actions });
       });
     });
   }
@@ -212,7 +261,7 @@ export class CodexAdapter implements AgentAdapter {
       this.persistState();
     }
     session.updated_at = new Date().toISOString();
-    return { session, message: result.message };
+    return { session, message: result.message, actions: result.actions };
   }
 
   async cancelTask(taskId: string): Promise<void> {

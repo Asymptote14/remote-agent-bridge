@@ -54,12 +54,29 @@ export type SessionEvent = {
   session?: AgentSession;
   error?: string;
 };
+/**
+ * One thing the provider actually did, as opposed to what it said about it.
+ *
+ * The phone gets the agent's own summary as the message; these are the trace
+ * behind it. `detail` is already truncated for a small screen — full command
+ * output stays in the logs, not in the protocol.
+ */
+export type TaskActionKind = 'command' | 'file' | 'error';
+export type TaskAction = {
+  kind: TaskActionKind;
+  detail: string;
+  exit_code?: number | null;
+  status?: string;
+};
+
 export type TaskEvent = {
   task_id: string;
   state: TaskState;
   message: string;
   provider_id?: string;
   session_id?: string;
+  /** What was done, carried on the terminal event. */
+  actions?: TaskAction[];
 };
 
 export function envelope<T>(type: string, payload: T, requestId: string = crypto.randomUUID()): Envelope<T> {

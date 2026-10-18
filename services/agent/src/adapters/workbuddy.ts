@@ -153,6 +153,11 @@ export class WorkBuddyAdapter implements AgentAdapter {
         ...process.env,
         FORCE_COLOR: '0',
         CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS: '1',
+        // WorkBuddy 2.161 ships only `dist/codebuddy-lite-wb.mjs`, and the
+        // launcher's own fallback chain does not pick it up: without this flag
+        // it dies on `require('../dist/codebuddy')`, which reads as a broken
+        // install rather than a missing bundle selection.
+        CODEBUDDY_FORCE_LITE_WB_BUNDLE: '1',
         // WorkBuddy keeps its login, settings and transcript database here.
         // Reusing this directory is what makes the bundled CLI behave like the
         // desktop product instead of creating a separate unauthenticated CLI.

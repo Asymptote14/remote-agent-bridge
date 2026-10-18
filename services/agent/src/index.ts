@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'n
 import { join } from 'node:path';
 import { envelope, type AgentSession, type Envelope, type SessionCreate, type SessionSwitch, type TaskCreate, type TaskEvent } from '@rab/protocol';
 import type { AgentAdapter } from '@rab/adapter-sdk';
+import { AdapterTaskError } from '@rab/adapter-sdk';
 import { LocalAdapter } from './adapters/local.js';
 import { HttpAdapter } from './adapters/http.js';
 import { WorkBuddyAdapter } from './adapters/workbuddy.js';
@@ -97,7 +98,7 @@ async function runNext() {
       }),
       { totalMs, idleMs },
     );
-    emitTask({ task_id: task.task_id, state: 'succeeded', message: result.message, provider_id: providerId, session_id: result.session.id });
+    emitTask({ task_id: task.task_id, state: 'succeeded', message: result.message, provider_id: providerId, session_id: result.session.id, actions: result.actions });
   } catch (error) {
     const timedOut = error instanceof TaskTimeoutError;
     if (timedOut && provider) {
@@ -105,7 +106,10 @@ async function runNext() {
       emitTask({ task_id: task.task_id, state: 'running', message: '任务超时，正在终止 Provider 进程树…', provider_id: providerId, session_id: task.session_id });
       try { await provider.cancelTask(task.task_id); } catch { /* The child may have exited while the timeout fired. */ }
     }
-    emitTask({ task_id: task.task_id, state: 'failed', message: error instanceof Error ? error.message : 'provider_execution_failed', provider_id: providerId, session_id: task.session_id });
+    // A failed task is exactly when "what it tried" matters, so the adapter's
+    // trace rides along even here.
+    const actions = error instanceof AdapterTaskError ? error.actions : undefined;
+    emitTask({ task_id: task.task_id, state: 'failed', message: error instanceof Error ? error.message : 'provider_execution_failed', provider_id: providerId, session_id: task.session_id, actions });
   } finally {
     running = false;
     void runNext();

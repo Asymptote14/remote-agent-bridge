@@ -211,6 +211,13 @@ describe('task records across a gateway restart', () => {
       assert.equal(scoped.data.length, 2);
       const unscoped = await api(gateway.base, '/api/tasks?session_id=session-does-not-exist', { token: paired.ownerToken });
       assert.deepEqual(unscoped.data, []);
+
+      // The action trace the agent attached to the terminal event has to survive
+      // the gateway and reach the phone; it is the "what did it actually do"
+      // half of a result, and the summary alone does not carry it.
+      const finished = list.data.find(task => task.task_id === 'task-order-new');
+      assert.ok(Array.isArray(finished.actions), 'the reconciliation list should carry the action trace');
+      assert.deepEqual(finished.actions[0], { kind: 'command', detail: 'echo task-order-new', exit_code: 0 });
     } finally {
       agent?.close();
       await gateway.stop();

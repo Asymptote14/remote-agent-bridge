@@ -63,6 +63,9 @@ app.get<{ Querystring: { session_id?: string } }>('/api/tasks', async (request, 
         task_id: taskId,
         state: last?.state ?? 'queued',
         message: last?.message ?? '',
+        // What the provider actually did. The message above is its own summary;
+        // this is the trace behind it, and the phone renders it on demand.
+        actions: last?.actions,
         session_id: record.session_id,
         created_at: record.created_at,
         updated_at: record.updated_at,

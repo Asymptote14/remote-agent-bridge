@@ -272,7 +272,16 @@ export class FakeAgent {
         version: 1,
         type: 'task.event',
         request_id: `evt-${state}`,
-        payload: { task_id: task.task_id, state, message: text, provider_id: task.provider_id ?? 'local', session_id: task.session_id },
+        payload: {
+          task_id: task.task_id,
+          state,
+          message: text,
+          provider_id: task.provider_id ?? 'local',
+          session_id: task.session_id,
+          // The real agent attaches the provider's action trace to the terminal
+          // event; the gateway only has to carry it through.
+          ...(state === 'succeeded' ? { actions: [{ kind: 'command', detail: `echo ${task.task_id}`, exit_code: 0 }] } : {}),
+        },
       }));
       send('queued', '已排队');
       send('running', '执行中');

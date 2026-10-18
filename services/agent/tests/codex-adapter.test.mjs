@@ -34,6 +34,18 @@ function installCli(name, source) {
 const okCli = installCli('fake-codex-ok', [
   "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-fake-1' }));",
   "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'fake codex finished the job' } }));",
+  // Shaped after real `codex exec --json` output: these are the items the
+  // adapter used to throw away after keeping only the final agent_message.
+  "console.log(JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'command_execution', command: 'npm test', exit_code: 0, status: 'completed', aggregated_output: 'ok' } }));",
+  "console.log(JSON.stringify({ type: 'item.completed', item: { id: 'i2', type: 'command_execution', command: 'npm run build', exit_code: 1, status: 'failed' } }));",
+].join('\n'));
+
+/** A CLI that does something and then fails, so the trace must survive the error. */
+const failCli = installCli('fake-codex-fail', [
+  "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-fail' }));",
+  "console.log(JSON.stringify({ type: 'item.completed', item: { id: 'i1', type: 'command_execution', command: 'rm -rf build', exit_code: 1, status: 'failed' } }));",
+  "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'error', message: 'command rejected by sandbox' } }));",
+  'process.exit(1);',
 ].join('\n'));
 
 /**
@@ -100,6 +112,46 @@ test('the codex adapter turns CLI JSON output into a task result', async () => {
     timeoutMs: 30_000,
   });
   assert.equal(result.message, 'fake codex finished the job');
+});
+
+test('the adapter reports what the CLI actually ran, not just its summary', async () => {
+  const adapter = codexAdapter(okCli, 'codex-actions');
+  const session = await adapter.createSession({ sessionId: 'session-actions' });
+  const result = await adapter.sendMessage({
+    taskId: 'task-actions',
+    sessionId: session.id,
+    text: 'run the checks',
+    mode: 'isolated',
+    timeoutMs: 30_000,
+  });
+  assert.ok(Array.isArray(result.actions), 'actions should be reported');
+  assert.deepEqual(
+    result.actions.map(action => [action.kind, action.detail, action.exit_code]),
+    [['command', 'npm test', 0], ['command', 'npm run build', 1]],
+  );
+  assert.equal(result.actions[0].status, 'completed');
+});
+
+test('a failed run still carries the trace of what it tried', async () => {
+  const adapter = codexAdapter(failCli, 'codex-fail');
+  const session = await adapter.createSession({ sessionId: 'session-fail' });
+  let caught;
+  try {
+    await adapter.sendMessage({
+      taskId: 'task-fail',
+      sessionId: session.id,
+      text: 'build it',
+      mode: 'isolated',
+      timeoutMs: 30_000,
+    });
+  } catch (error) {
+    caught = error;
+  }
+  assert.ok(caught, 'the run should fail');
+  assert.match(caught.message, /command rejected by sandbox/);
+  assert.ok(Array.isArray(caught.actions), 'a failed adapter should still hand back its actions');
+  assert.deepEqual(caught.actions.map(action => action.kind), ['command', 'error']);
+  assert.equal(caught.actions[0].exit_code, 1);
 });
 
 test('the adapter refuses to run a task outside isolated mode', async () => {
