@@ -1,4 +1,4 @@
-param(
+﻿param(
   [ValidateSet('start', 'stop', 'status', 'restart', 'open', 'tray', 'install-tray', 'uninstall-tray')]
   [string]$Command = 'status'
 )
@@ -117,6 +117,24 @@ function Show-Status {
 }
 
 function Open-Setup {
+  # The setup page is served by the Gateway itself, so opening it while the
+  # service is stopped can only ever fail: nothing is listening on the port and
+  # the setup token does not exist yet either. Start it first.
+  $health = $null
+  try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/health' -TimeoutSec 2 } catch { }
+  if (-not $health) {
+    Write-Host 'Service is not running, starting it first...'
+    Start-Rab
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline -and -not $health) {
+      Start-Sleep -Milliseconds 500
+      try { $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8787/health' -TimeoutSec 2 } catch { }
+    }
+    if (-not $health) {
+      Write-Host 'Service did not come up within 30s. Run "npm run status" to see why.'
+      return
+    }
+  }
   # The privileged setup API requires the setup token, because a tunnel forwards
   # to 127.0.0.1 and would otherwise look local. The token lives in the data
   # directory, so only this machine can read it.
@@ -126,7 +144,7 @@ function Open-Setup {
     $token = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
     if ($token) { $url = "$url`?token=$token" }
   } else {
-    Write-Host "No setup token yet ($tokenFile). Start the service once, then run setup again."
+    Write-Host "No setup token yet ($tokenFile). Run this again once the service has started."
   }
   try {
     # ShellExecute (Start-Process' default when nothing is redirected) hands the
