@@ -129,11 +129,13 @@ function Open-Setup {
     Write-Host "No setup token yet ($tokenFile). Start the service once, then run setup again."
   }
   try {
-    # explorer.exe hands the URL to the already-running shell instead of
-    # starting a browser as a child of this process. Without it, an elevated
-    # caller makes Windows try to open the page with an elevated browser, which
-    # Edge answers with "Microsoft Edge 未响应，因为现有实例正在以提升的权限运行".
-    Start-Process -FilePath 'explorer.exe' -ArgumentList $url -ErrorAction Stop | Out-Null
+    # ShellExecute (Start-Process' default when nothing is redirected) hands the
+    # URL to the running shell, which is what makes it open in the normal
+    # browser. Do NOT route this through explorer.exe: when this script is
+    # reached from the tray - which spawns it with UseShellExecute=false - the
+    # inherited standard handles make explorer.exe die on start with
+    # 0xc0000142 (STATUS_DLL_INIT_FAILED).
+    Start-Process $url -ErrorAction Stop | Out-Null
     Write-Host 'Opened setup page: http://127.0.0.1:8787/setup'
   } catch {
     Write-Host 'Service is running. Open this address manually:'
