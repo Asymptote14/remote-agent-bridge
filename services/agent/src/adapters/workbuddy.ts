@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, basename, dirname, extname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import type { AgentAdapter, AdapterResult, CreateSessionInput, SendMessageInput } from '@rab/adapter-sdk';
+import type { AgentAdapter, AdapterResult, CancelOutcome, CreateSessionInput, SendMessageInput } from '@rab/adapter-sdk';
 import type { AgentProviderInfo, AgentSession } from '@rab/protocol';
 import { dataDir, type ProviderConfig } from '@rab/config';
 import { terminateProcessTree } from '../process-control.js';
@@ -84,10 +84,12 @@ export class WorkBuddyAdapter implements AgentAdapter {
   async listSessions(): Promise<AgentSession[]> { return [...this.sessions.values()]; }
 
   async createSession(input: CreateSessionInput): Promise<AgentSession> {
+    input.signal?.throwIfAborted();
     return this.session(input.sessionId, input.title?.trim() || 'WorkBuddy 会话');
   }
 
-  async switchSession(sessionId: string): Promise<AgentSession> {
+  async switchSession(sessionId: string, signal?: AbortSignal): Promise<AgentSession> {
+    signal?.throwIfAborted();
     return this.session(sessionId);
   }
 
@@ -104,10 +106,8 @@ export class WorkBuddyAdapter implements AgentAdapter {
   private command(): { file: string; argsPrefix: string[] } {
     const script = this.cliScript();
     const extension = extname(script).toLowerCase();
-    if (extension === '.cmd' || extension === '.bat') {
-      return { file: process.env.ComSpec || 'cmd.exe', argsPrefix: ['/d', '/s', '/c', script] };
-    }
-    if (extension === '.js' || basename(script).toLowerCase() === 'codebuddy') {
+    if (['.cmd', '.bat'].includes(extension)) throw new Error('cli_shell_wrapper_unsupported');
+    if (['.js', '.mjs', '.cjs'].includes(extension) || basename(script).toLowerCase() === 'codebuddy') {
       return { file: this.config.runtime?.trim() || process.execPath, argsPrefix: [script] };
     }
     return { file: script, argsPrefix: [] };
@@ -125,6 +125,7 @@ export class WorkBuddyAdapter implements AgentAdapter {
 
   private async run(input: SendMessageInput, externalSessionId?: string): Promise<{ message: string; externalSessionId?: string }> {
     const command = this.command();
+    if (input.text.trimStart().startsWith('-')) throw new Error('provider_prompt_must_not_start_with_option');
     const args = [
       ...command.argsPrefix,
       '-p',
@@ -137,6 +138,7 @@ export class WorkBuddyAdapter implements AgentAdapter {
     args.push(input.text);
 
     const cwd = resolve(this.config.cwd?.trim() || process.env.RAB_WORKSPACE || process.cwd());
+    input.signal?.throwIfAborted();
     const workbuddyConfigDir = process.env.WORKBUDDY_CONFIG_DIR || process.env.CODEBUDDY_CONFIG_DIR || join(homedir(), '.workbuddy');
     // The bundled CLI expects its per-project transcript directory to exist.
     // Desktop WorkBuddy normally creates it before spawning the sidecar; the
@@ -167,6 +169,8 @@ export class WorkBuddyAdapter implements AgentAdapter {
       },
     });
     this.running.set(input.taskId, child);
+    child.stdin.on('error', () => {});
+    child.stdin.end();
 
     return new Promise((resolveResult, reject) => {
       let stdout = '';
@@ -193,9 +197,12 @@ export class WorkBuddyAdapter implements AgentAdapter {
       child.on('close', code => {
         const events: StreamEvent[] = [];
         for (const line of stdout.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) {
-          try { events.push(JSON.parse(line) as StreamEvent); } catch { /* CLI diagnostics can share stdout. */ }
+          try {
+            const event: unknown = JSON.parse(line);
+            if (event && typeof event === 'object' && !Array.isArray(event)) events.push(event as StreamEvent);
+          } catch { /* CLI diagnostics can share stdout. */ }
         }
-        const init = events.find(event => event.type === 'system' && event.subtype === 'init' && event.session_id);
+        const init = events.find(event => event.type === 'system' && event.subtype === 'init' && typeof event.session_id === 'string');
         const final = [...events].reverse().find(event => event.type === 'result');
         const assistant = events
           .filter(event => event.type === 'assistant')
@@ -203,7 +210,7 @@ export class WorkBuddyAdapter implements AgentAdapter {
           .filter(Boolean)
           .join('\n');
         const message = this.extractText(final?.result ?? final?.message ?? final?.content) || assistant || stderr.trim();
-        const external = init?.session_id || events.find(event => event.session_id)?.session_id;
+        const external = init?.session_id || events.find(event => typeof event.session_id === 'string')?.session_id;
         if (code !== 0) finish(new Error(message || `workbuddy_exit_${code}`));
         else if (!message) finish(new Error('workbuddy_empty_response'));
         else finish(undefined, { message, externalSessionId: external });
@@ -213,7 +220,8 @@ export class WorkBuddyAdapter implements AgentAdapter {
 
   async sendMessage(input: SendMessageInput): Promise<AdapterResult> {
     if (input.mode !== 'isolated') throw new Error('workbuddy_foreground_mode_disabled');
-    const session = await this.switchSession(input.sessionId);
+    const session = await this.switchSession(input.sessionId, input.signal);
+    input.signal?.throwIfAborted();
     const external = this.externalSessionIds.get(input.sessionId);
     const result = await this.run(input, external);
     if (result.externalSessionId && result.externalSessionId !== external) {
@@ -224,11 +232,12 @@ export class WorkBuddyAdapter implements AgentAdapter {
     return { session, message: result.message };
   }
 
-  async cancelTask(taskId: string): Promise<void> {
+  async cancelTask(taskId: string): Promise<CancelOutcome> {
     const child = this.running.get(taskId);
-    if (!child) return;
+    if (!child) return 'not_found';
     // `child.kill()` would only take down the launcher and leave the real
     // CodeBuddy process running; see process-control.ts.
-    await terminateProcessTree(child);
+    if (await terminateProcessTree(child) === 'exited') throw new Error('process_tree_unconfirmed');
+    return 'stopped';
   }
 }

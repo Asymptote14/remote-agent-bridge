@@ -1,5 +1,4 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { WebSocket } from 'ws';
 import { app } from '../app.js';
 import { slot } from '../agent-slot.js';
@@ -15,10 +14,15 @@ app.get('/health', async () => ({
 }));
 
 app.get('/', async (_request, reply) => {
-  const html = await readFile(join(process.cwd(), 'apps', 'web', 'index.html'), 'utf8');
-  return reply.type('text/html; charset=utf-8').send(html);
+  return reply.type('text/html; charset=utf-8').header('content-security-policy', "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+    .send(await readFile(new URL('../../../web/index.html', import.meta.url), 'utf8'));
 });
 app.get('/setup', async (_request, reply) => {
-  const html = await readFile(join(process.cwd(), 'apps', 'web', 'setup.html'), 'utf8');
-  return reply.type('text/html; charset=utf-8').send(html);
+  return reply.type('text/html; charset=utf-8').send(await readFile(new URL('../../../web/setup.html', import.meta.url), 'utf8'));
 });
+
+for (const [file, contentType] of [['chat.js', 'text/javascript'], ['chat.css', 'text/css']]) {
+  app.get(`/assets/${file}`, async (_request, reply) => {
+    return reply.type(`${contentType}; charset=utf-8`).send(await readFile(new URL(`../../../web/${file}`, import.meta.url), 'utf8'));
+  });
+}

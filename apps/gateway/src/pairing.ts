@@ -1,4 +1,6 @@
 import type { FastifyBaseLogger } from 'fastify';
+import { randomInt } from 'node:crypto';
+import type { WebSocket } from 'ws';
 import { devices, pairings, pairingAttempts } from './state.js';
 
 /**
@@ -9,15 +11,17 @@ import { devices, pairings, pairingAttempts } from './state.js';
  * the local /setup page — so holding the agent slot is not enough to obtain one.
  */
 
-export function issuePairing(deviceId: string, log: FastifyBaseLogger): { code: string; expires_in: number } | undefined {
+export function issuePairing(deviceId: string, socket: WebSocket, log: FastifyBaseLogger): { code: string; expires_in: number } | undefined {
   const now = Date.now();
   for (const [code, pairing] of pairings) if (pairing.expires <= now) pairings.delete(code);
   const device = devices.get(deviceId);
   if (!device) return undefined;
-  if (device.pairing) pairings.delete(device.pairing);
-  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const previousCode = device.pairing;
+  let code: string;
+  do { code = String(randomInt(100000, 1000000)); } while (code === previousCode || pairings.has(code));
+  if (previousCode) pairings.delete(previousCode);
   device.pairing = code;
-  pairings.set(code, { deviceId, expires: Date.now() + 60_000 });
+  pairings.set(code, { deviceId, socket, expires: Date.now() + 60_000 });
   // The pairing code is no longer pushed over the Agent WebSocket. It stays on
   // the Gateway until the operator fetches it from the local /setup page.
   log.info({ device_id: deviceId }, 'pairing code issued (visible on local /setup page only)');

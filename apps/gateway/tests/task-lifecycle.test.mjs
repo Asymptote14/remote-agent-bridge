@@ -126,7 +126,7 @@ describe('task records across a gateway restart', () => {
         const response = await eventsOf(gateway, 'task-persist-1', ownerToken);
         return response.data?.some(event => event.state === 'succeeded') ? response.data : undefined;
       }, 10_000);
-      assert.deepEqual(events.map(event => event.state), ['queued', 'running', 'succeeded']);
+      assert.deepEqual(events.map(event => event.state), ['dispatch_pending', 'queued', 'running', 'succeeded']);
 
       agent.close();
       agent = undefined;
@@ -135,7 +135,7 @@ describe('task records across a gateway restart', () => {
 
       const after = await eventsOf(gateway, 'task-persist-1', ownerToken);
       assert.equal(after.status, 200, 'the task record must survive the restart');
-      assert.deepEqual(after.data.map(event => event.state), ['queued', 'running', 'succeeded']);
+      assert.deepEqual(after.data.map(event => event.state), ['dispatch_pending', 'queued', 'running', 'succeeded']);
     } finally {
       agent?.close();
       await gateway.stop();
@@ -171,15 +171,15 @@ describe('task records across a gateway restart', () => {
       const events = await eventsOf(gateway, 'task-inflight-1', ownerToken);
       assert.equal(events.status, 200);
       const last = events.data.at(-1);
-      assert.equal(last.state, 'failed');
-      assert.match(last.message, /gateway_restart/);
+      assert.equal(last.state, 'outcome_unknown');
+      assert.match(last.message, /gateway_restart|agent_disconnected/);
       assert.equal(last.session_id, sessionId);
 
       // The reconciliation list reports the same terminal state, which is what
       // releases the phone's pending entry.
       const list = await api(gateway.base, '/api/tasks', { token: ownerToken });
       const summary = list.data.find(task => task.task_id === 'task-inflight-1');
-      assert.equal(summary.state, 'failed');
+      assert.equal(summary.state, 'outcome_unknown');
       assert.equal(summary.session_id, sessionId);
     } finally {
       agent?.close();

@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { AgentAdapter, AdapterResult, CreateSessionInput, SendMessageInput } from '@rab/adapter-sdk';
+import type { AgentAdapter, AdapterResult, CancelOutcome, CreateSessionInput, SendMessageInput } from '@rab/adapter-sdk';
 import { AdapterTaskError } from '@rab/adapter-sdk';
 import type { AgentProviderInfo, AgentSession, TaskAction } from '@rab/protocol';
 import { dataDir, type ProviderConfig } from '@rab/config';
@@ -101,10 +101,12 @@ export class CodexAdapter implements AgentAdapter {
   async listSessions(): Promise<AgentSession[]> { return [...this.sessions.values()]; }
 
   async createSession(input: CreateSessionInput): Promise<AgentSession> {
+    input.signal?.throwIfAborted();
     return this.session(input.sessionId, input.title?.trim() || 'Codex 会话');
   }
 
-  async switchSession(sessionId: string): Promise<AgentSession> {
+  async switchSession(sessionId: string, signal?: AbortSignal): Promise<AgentSession> {
+    signal?.throwIfAborted();
     return this.session(sessionId);
   }
 
@@ -112,10 +114,8 @@ export class CodexAdapter implements AgentAdapter {
     const configured = this.config.executable?.trim();
     if (!configured) throw new Error('codex_cli_path_required');
     const extension = extname(configured).toLowerCase();
-    if (extension === '.cmd' || extension === '.bat') {
-      return { file: process.env.ComSpec || 'cmd.exe', argsPrefix: ['/d', '/s', '/c', configured] };
-    }
-    if (extension === '.js') return { file: this.config.runtime?.trim() || process.execPath, argsPrefix: [configured] };
+    if (['.cmd', '.bat'].includes(extension)) throw new Error('cli_shell_wrapper_unsupported');
+    if (['.js', '.mjs', '.cjs'].includes(extension)) return { file: this.config.runtime?.trim() || process.execPath, argsPrefix: [configured] };
     return { file: configured, argsPrefix: [] };
   }
 
@@ -194,12 +194,14 @@ export class CodexAdapter implements AgentAdapter {
   private async run(input: SendMessageInput, externalThreadId?: string): Promise<{ message: string; externalThreadId?: string; actions?: TaskAction[] }> {
     const command = this.command();
     const sandbox = this.config.sandboxMode || 'read-only';
+    if (!['read-only', 'workspace-write', 'danger-full-access'].includes(sandbox)) throw new Error('codex_sandbox_invalid');
     const bypass = this.config.permissionMode === 'bypassPermissions' || sandbox === 'danger-full-access';
     const args = externalThreadId
-      ? [...command.argsPrefix, 'exec', 'resume', externalThreadId, '--json', '--skip-git-repo-check', ...(bypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []), input.text]
-      : [...command.argsPrefix, 'exec', '--json', '--skip-git-repo-check', '--sandbox', sandbox, ...(bypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []), input.text];
+      ? [...command.argsPrefix, 'exec', 'resume', '--json', '--skip-git-repo-check', '--config', `sandbox_mode="${sandbox}"`, ...(bypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []), '--', externalThreadId, '-']
+      : [...command.argsPrefix, 'exec', '--json', '--skip-git-repo-check', '--sandbox', sandbox, ...(bypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []), '--', '-'];
 
     const cwd = resolve(this.config.cwd?.trim() || process.env.RAB_WORKSPACE || process.cwd());
+    input.signal?.throwIfAborted();
     const child = spawn(command.file, args, {
       cwd,
       windowsHide: true,
@@ -209,9 +211,8 @@ export class CodexAdapter implements AgentAdapter {
       env: { ...process.env, FORCE_COLOR: '0' },
     });
     this.running.set(input.taskId, child);
-    // The prompt is passed as an argument. Closing stdin prevents Codex from
-    // waiting for an optional extra prompt in a long-lived Agent process.
-    child.stdin.end();
+    child.stdin.on('error', () => {});
+    child.stdin.end(input.text, 'utf8');
 
     return new Promise((resolveResult, reject) => {
       let stdout = '';
@@ -238,10 +239,13 @@ export class CodexAdapter implements AgentAdapter {
       child.on('close', code => {
         const events: JsonEvent[] = [];
         for (const line of stdout.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) {
-          try { events.push(JSON.parse(line) as JsonEvent); } catch { /* diagnostics may share stdout */ }
+          try {
+            const event: unknown = JSON.parse(line);
+            if (event && typeof event === 'object' && !Array.isArray(event)) events.push(event as JsonEvent);
+          } catch { /* diagnostics may share stdout */ }
         }
-        const thread = events.find(event => event.type === 'thread.started' && event.thread_id)?.thread_id
-          || events.find(event => event.thread_id)?.thread_id;
+        const thread = events.find(event => event.type === 'thread.started' && typeof event.thread_id === 'string')?.thread_id
+          || events.find(event => typeof event.thread_id === 'string')?.thread_id;
         const message = this.completedMessage(events) || this.extractText(events[events.length - 1]?.result);
         const actions = this.taskActions(events);
         if (code !== 0) finish(new AdapterTaskError(this.errorText(events, stderr) || `codex_exit_${code}`, actions));
@@ -253,7 +257,8 @@ export class CodexAdapter implements AgentAdapter {
 
   async sendMessage(input: SendMessageInput): Promise<AdapterResult> {
     if (input.mode !== 'isolated') throw new Error('codex_foreground_mode_disabled');
-    const session = await this.switchSession(input.sessionId);
+    const session = await this.switchSession(input.sessionId, input.signal);
+    input.signal?.throwIfAborted();
     const externalThreadId = this.externalThreadIds.get(input.sessionId);
     const result = await this.run(input, externalThreadId);
     if (result.externalThreadId && result.externalThreadId !== externalThreadId) {
@@ -264,11 +269,12 @@ export class CodexAdapter implements AgentAdapter {
     return { session, message: result.message, actions: result.actions };
   }
 
-  async cancelTask(taskId: string): Promise<void> {
+  async cancelTask(taskId: string): Promise<CancelOutcome> {
     const child = this.running.get(taskId);
-    if (!child) return;
+    if (!child) return 'not_found';
     // `child.kill()` would only take down the launcher and leave the real
     // Codex process running; see process-control.ts.
-    await terminateProcessTree(child);
+    if (await terminateProcessTree(child) === 'exited') throw new Error('process_tree_unconfirmed');
+    return 'stopped';
   }
 }

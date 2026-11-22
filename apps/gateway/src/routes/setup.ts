@@ -23,7 +23,7 @@ app.get('/api/setup/status', async (request, reply) => {
       ? ['sakura_public_url_must_use_https']
       : [],
     provider_config: { path: getProviderConfigPath(), environment_override: Boolean(process.env.RAB_PROVIDERS_FILE) },
-    agent: { online: slot.agent?.readyState === WebSocket.OPEN, device_id: slot.deviceId, device_name: device?.name, platform: device?.platform },
+    agent: { online: slot.agent?.readyState === WebSocket.OPEN, device_id: slot.deviceId, device_name: device?.name, platform: device?.platform, auth_mode: slot.authMode, key_bound: Boolean(device?.auth_public_key), queue_paused: slot.queuePaused },
     pairing: pairing && pairing.expires > Date.now() ? { code: device?.pairing, expires_at: pairing.expires } : undefined,
   };
 });
@@ -58,7 +58,8 @@ app.post('/api/setup/pairing/renew', async (request, reply) => {
   if (!slot.authenticated && !slot.local) {
     return reply.code(409).send({ error: 'agent_not_trusted', hint: 'The connected device has not proven it runs on this machine. Restart the local Agent.' });
   }
-  return issuePairing(slot.deviceId, app.log);
+  if (devices.get(slot.deviceId)?.owner) return reply.code(409).send({ error: 'device_already_bound' });
+  return issuePairing(slot.deviceId, slot.agent, app.log);
 });
 app.get('/api/setup/providers', async (request, reply) => {
   if (!requireLocalOperator(request, reply)) return;
@@ -78,7 +79,8 @@ app.post<{ Body: ProviderConfig }>('/api/setup/providers', async (request, reply
   const transport = input.transport;
   if (!input.id || !input.name || !['http', 'cli'].includes(transport)) return reply.code(400).send({ error: 'provider_requires_id_name_and_supported_transport' });
   if (transport === 'http' && !input.endpoint) return reply.code(400).send({ error: 'http_provider_requires_endpoint' });
-  if (transport === 'cli' && !input.executable) return reply.code(400).send({ error: 'cli_provider_requires_executable' });
+  if (transport === 'cli' && (typeof input.executable !== 'string' || !input.executable.trim())) return reply.code(400).send({ error: 'cli_provider_requires_executable' });
+  if (transport === 'cli' && /\.(cmd|bat)$/iu.test(input.executable!.trim())) return reply.code(400).send({ error: 'cli_shell_wrapper_unsupported' });
   const items = readProviderConfigs().filter(item => item.id !== input.id);
   const old = readProviderConfigs().find(item => item.id === input.id);
   items.push({

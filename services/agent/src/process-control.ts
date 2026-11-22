@@ -60,21 +60,38 @@ function taskkillExecutable(): string {
  * Windows: a graceful single-process kill would take the parent down first and
  * orphan the descendants we are actually trying to reach.
  */
-function taskkillTree(pid: number): Promise<void> {
-  return new Promise(resolve => {
+function taskkillTree(pid: number, timeout: number): Promise<void> {
+  return new Promise((resolve, reject) => {
     execFile(
       taskkillExecutable(),
       ['/PID', String(pid), '/T', '/F'],
-      { windowsHide: true },
-      // A non-zero exit just means the tree was already gone.
-      () => resolve(),
+      { windowsHide: true, timeout, maxBuffer: 64 * 1024 },
+      error => {
+        if (error) reject(new Error(error.killed ? 'taskkill_timeout' : `taskkill_failed:${error.code ?? 'unknown'}`));
+        else resolve();
+      },
     );
   });
 }
 
-function signalGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); } catch { /* The group may already be gone. */ }
-  try { process.kill(pid, signal); } catch { /* The leader may already be gone. */ }
+function signalGroup(pid: number, signal: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function waitForGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (signalGroup(pid, 0)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await new Promise(resolve => setTimeout(resolve, Math.min(remaining, 50)));
+  }
+  return true;
 }
 
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
@@ -98,10 +115,8 @@ function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
 }
 
 /**
- * Terminates a child and every process it spawned, and resolves only once the
- * child has actually exited. The Agent runs one task at a time and starts the
- * next as soon as cancellation resolves, so a surviving grandchild would
- * overlap with the following task rather than merely linger.
+ * Stop the Windows tree or POSIX process group. Reject if the platform cannot
+ * confirm cleanup so callers can keep the next task from starting.
  */
 export async function terminateProcessTree(
   child: ChildProcess,
@@ -109,22 +124,23 @@ export async function terminateProcessTree(
 ): Promise<TerminateOutcome> {
   const graceMs = options.graceMs ?? DEFAULT_GRACE_MS;
   const pid = child.pid;
-  if (typeof pid !== 'number' || child.exitCode !== null || child.signalCode !== null) return 'exited';
-  if (!isProcessAlive(pid)) return 'exited';
+  if (typeof pid !== 'number') return 'exited';
 
   if (process.platform === 'win32') {
-    await taskkillTree(pid);
-    if (await waitForExit(child, graceMs)) return 'forced';
-    // taskkill refused to take something down (elevated or otherwise protected).
-    try { child.kill('SIGKILL'); } catch { /* Already gone. */ }
-    await waitForExit(child, graceMs);
+    if (child.exitCode !== null || child.signalCode !== null) return 'exited';
+    await taskkillTree(pid, graceMs);
+    if (!(await waitForExit(child, graceMs))) throw new Error('process_exit_unconfirmed');
     return 'forced';
   }
 
-  signalGroup(pid, 'SIGTERM');
-  if (await waitForExit(child, graceMs)) return 'graceful';
-
+  if (!signalGroup(pid, 'SIGTERM')) {
+    if (child.exitCode !== null || child.signalCode !== null) return 'exited';
+    throw new Error('process_group_missing');
+  }
+  if (await waitForGroupExit(pid, graceMs) && await waitForExit(child, graceMs)) return 'graceful';
   signalGroup(pid, 'SIGKILL');
-  await waitForExit(child, graceMs);
+  if (!(await waitForGroupExit(pid, graceMs)) || !(await waitForExit(child, graceMs))) {
+    throw new Error('process_group_exit_unconfirmed');
+  }
   return 'forced';
 }

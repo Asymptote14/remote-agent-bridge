@@ -1,8 +1,6 @@
 name: CI
 
-# Runs exactly what `pnpm test` runs locally: a TypeScript build of every
-# workspace project, then the full node:test suite. Nothing here is CI-only, so
-# a green run means a developer's machine would be green too.
+# Runs the same unit, integration and Local Agent smoke commands as local development.
 #
 # The matrix covers both platforms on purpose. The suite exercises two
 # genuinely different process-termination paths — `taskkill /T /F` on Windows
@@ -58,3 +56,6 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Local Agent smoke
+        run: node apps/gateway/tests/live-smoke.mjs

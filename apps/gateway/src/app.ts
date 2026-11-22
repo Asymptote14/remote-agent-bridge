@@ -8,4 +8,6 @@ import Fastify from 'fastify';
  * group would have re-indented several hundred lines for no behavioural gain.
  * index.ts imports each route module for its registration side effect.
  */
-export const app = Fastify({ logger: true });
+export const app = Fastify({
+  logger: { serializers: { req: request => ({ method: request.method, path: String(request.url ?? '').split('?')[0] }) } },
+});

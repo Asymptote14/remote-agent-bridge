@@ -68,7 +68,7 @@ function describe(ms: number): string {
  */
 export function runWithTimeouts<T>(
   start: (onActivity: () => void) => Promise<T>,
-  options: { totalMs: number; idleMs: number },
+  options: { totalMs: number; idleMs: number; signal?: AbortSignal },
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -79,13 +79,14 @@ export function runWithTimeouts<T>(
       settled = true;
       clearTimeout(totalTimer);
       if (idleTimer) clearTimeout(idleTimer);
+      options.signal?.removeEventListener('abort', onAbort);
       settle();
     };
 
     const totalTimer = setTimeout(() => {
       finish(() => reject(new TaskTimeoutError(
         'task_timeout',
-        `[task_timeout] 任务超过 ${describe(options.totalMs)}仍未完成，已终止 Provider 进程树`,
+        `[task_timeout] 任务超过 ${describe(options.totalMs)}仍未完成`,
       )));
     }, options.totalMs);
 
@@ -94,7 +95,7 @@ export function runWithTimeouts<T>(
       idleTimer = setTimeout(() => {
         finish(() => reject(new TaskTimeoutError(
           'task_idle_timeout',
-          `[task_idle_timeout] 任务连续 ${describe(options.idleMs)}没有任何输出，判定为挂起并已终止 Provider 进程树`,
+          `[task_idle_timeout] 任务连续 ${describe(options.idleMs)}没有任何输出，判定为挂起`,
         )));
       }, options.idleMs);
     };
@@ -104,6 +105,10 @@ export function runWithTimeouts<T>(
       if (settled) return;
       armIdle();
     };
+
+    const onAbort = () => finish(() => reject(options.signal?.reason));
+    if (options.signal?.aborted) { onAbort(); return; }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
 
     let work: Promise<T>;
     try {

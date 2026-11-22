@@ -155,8 +155,7 @@ function Open-Setup {
     Start-Process $url -ErrorAction Stop | Out-Null
     Write-Host 'Opened setup page: http://127.0.0.1:8787/setup'
   } catch {
-    Write-Host 'Service is running. Open this address manually:'
-    Write-Host $url
+    Write-Host 'Could not open setup automatically. Open http://127.0.0.1:8787/setup and follow the local token instructions.'
   }
 }
 

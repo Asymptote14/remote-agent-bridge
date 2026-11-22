@@ -77,11 +77,13 @@ async function waitForDeath(pid, timeoutMs = 15_000) {
   return !isProcessAlive(pid);
 }
 
-test('terminateProcessTree removes the launcher and the process it spawned', async () => {
+test('terminateProcessTree removes the launcher and the process it spawned', async (context) => {
   const pidFile = join(tmp, 'grandchild-a.pid');
   const launcher = launchTree(pidFile);
+  context.after(() => { launcher.kill(); });
 
   const grandchildPid = await waitForPidFile(pidFile);
+  context.after(() => { try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* fixture already exited */ } });
   assert.ok(isProcessAlive(grandchildPid), 'the fake Codex process should be running first');
 
   const outcome = await terminateProcessTree(launcher);
@@ -91,11 +93,13 @@ test('terminateProcessTree removes the launcher and the process it spawned', asy
   assert.equal(launcher.exitCode === null && launcher.signalCode === null, false, 'the launcher should have exited');
 });
 
-test('the killed tree leaves nothing behind to overlap the next task', async () => {
+test('the killed tree leaves nothing behind to overlap the next task', async (context) => {
   const pidFile = join(tmp, 'grandchild-b.pid');
   const launcher = launchTree(pidFile);
+  context.after(() => { launcher.kill(); });
 
   const grandchildPid = await waitForPidFile(pidFile);
+  context.after(() => { try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* fixture already exited */ } });
   await terminateProcessTree(launcher);
 
   // The Agent runs one task at a time and starts the next the moment
@@ -111,9 +115,25 @@ test('an already-exited child is reported as exited and is safe to terminate twi
   assert.equal(await terminateProcessTree(child), 'exited');
 });
 
-test('terminating a child that never spawned a process is safe', async () => {
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+test('terminating a child that never spawned a process is safe', async (context) => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true, detached: !isWindows });
+  context.after(() => { child.kill(); });
   const outcome = await terminateProcessTree(child);
   assert.ok(['graceful', 'forced'].includes(outcome), `unexpected outcome: ${outcome}`);
   assert.ok(await waitForDeath(child.pid));
+});
+
+test('does not report success when the Windows tree tool cannot run', { skip: !isWindows }, async (context) => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true });
+  context.after(() => { child.kill(); });
+  await once(child, 'spawn');
+  const originalRoot = process.env.SystemRoot;
+  try {
+    process.env.SystemRoot = tmp;
+    await assert.rejects(terminateProcessTree(child), /taskkill_failed:/);
+    assert.ok(isProcessAlive(child.pid));
+  } finally {
+    if (originalRoot === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = originalRoot;
+  }
 });

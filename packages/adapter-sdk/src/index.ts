@@ -1,6 +1,6 @@
 import type { AgentProviderInfo, AgentSession, ConversationMessage, InteractionMode, TaskAction } from '@rab/protocol';
 
-export type CreateSessionInput = { sessionId: string; title?: string };
+export type CreateSessionInput = { sessionId: string; title?: string; signal?: AbortSignal };
 export type SendMessageInput = {
   taskId: string;
   sessionId: string;
@@ -8,6 +8,7 @@ export type SendMessageInput = {
   mode: InteractionMode;
   timeoutMs: number;
   history?: ConversationMessage[];
+  signal?: AbortSignal;
   /**
    * Adapters must call this whenever the provider shows progress (for example
    * on each chunk of child process output). The Agent treats prolonged silence
@@ -28,13 +29,15 @@ export type AdapterResult = {
   actions?: TaskAction[];
 };
 
+export type CancelOutcome = 'stopped' | 'not_found';
+
 export interface AgentAdapter {
   readonly provider: AgentProviderInfo;
   listSessions(): Promise<AgentSession[]>;
   createSession(input: CreateSessionInput): Promise<AgentSession>;
-  switchSession(sessionId: string): Promise<AgentSession>;
+  switchSession(sessionId: string, signal?: AbortSignal): Promise<AgentSession>;
   sendMessage(input: SendMessageInput): Promise<AdapterResult>;
-  cancelTask(taskId: string): Promise<void>;
+  cancelTask(taskId: string): Promise<CancelOutcome>;
 }
 
 /**
@@ -48,5 +51,12 @@ export class AdapterTaskError extends Error {
     super(message);
     this.name = 'AdapterTaskError';
     this.actions = actions;
+  }
+}
+
+export class ExecutionUnconfirmedError extends AdapterTaskError {
+  constructor(message: string, actions?: TaskAction[]) {
+    super(message, actions);
+    this.name = 'ExecutionUnconfirmedError';
   }
 }

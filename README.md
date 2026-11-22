@@ -1,50 +1,48 @@
 # Remote Agent Bridge
 
-通过手机聊天控制自己的电脑 Agent。项目是自托管模式，不依赖云端账号、云端 Gateway 或公网中继；手机和电脑之间的局域网、虚拟局域网或隧道由用户自行提供。
+在手机上给自己的电脑提交任务、查看状态和结果。Gateway 和 Agent 都跑在同一台电脑；项目不提供云端账号、云端 Gateway 或公网中继。内置 Local 可以离线工作，第三方执行器是否联网取决于它自己的配置。
 
 ## 当前状态
 
-这是 v0.1 MVP，已实现本地账号认证、设备配对、持久化会话/消息、移动端 Web 页面、本地 Provider、WorkBuddy 无头 Provider、Codex CLI Provider 和任务闭环：Gateway 接收任务并转发给 Agent，Agent 返回排队、运行和完成事件。
+这是 **v0.1 私网试用版**，定位为单操作者、单电脑、单实例。已实现账号登录、设备配对、会话历史、手机工作台和可恢复的任务记录。适合先用内置只读执行器验证流程；不是公开网络部署版，也未完成真机兼容与发布验收。开发顺序见 [实施路线图](docs/roadmap.md)，升级、恢复和试用步骤见 [运维与验收手册](docs/operations.md)。
 
-默认执行模式是隔离模式：Agent 在后台队列中处理任务，不主动抢占用户当前的鼠标、键盘或前台窗口。需要 GUI 前台控制的任务会被当前版本拒绝，避免打断用户正在进行的游戏或工作。设计细节见 `docs/non-interference.md`。
+Agent 默认在后台队列工作，不接管鼠标、键盘或前台窗口。**后台执行不是安全沙箱，任务确认也不是权限提升或权限检查。** 第三方执行器仍受其自身实际权限约束。设计细节见 [非干扰执行](docs/non-interference.md)。
 
 项目采用通用 Provider Adapter 和 Session 模型。当前实际实现的适配器只有四个：内置的 `local`（只读系统查询）、`http`、WorkBuddy 无头 CLI（Windows 上可在配置页自动发现 WorkBuddy，用其自带的 CodeBuddy CLI 执行）和 Codex CLI。协议里为 `websocket`、`mcp`、`gui` 预留了传输类型，但**这三种适配器尚未实现**，配置页也接不进它们。适配器规范见 `docs/agent-adapters.md`。
 
-网络访问配置见 `docs/network-access.md`。支持通过樱花内网穿透或 Tailscale/ZeroTier 等虚拟局域网访问；Gateway 会直接提供手机 Web 页面，页面会自动使用当前访问地址。会话、消息和任务记录保存在 `.rab/state.json`（任务记录保留 24 小时、最多 200 条），设备身份保存在 `.rab/agent-identity.json`。`.rab/` 统一放在工作区根目录，Gateway 和 Agent 共用同一份。同一 `task_id` 重复提交是幂等的：重复请求只返回已有结果，不会再次派发给 Agent，也不会重复写入会话消息。
+推荐先在本机验证，再配置 [可信私网访问](docs/network-access.md)。Gateway 直接提供工作台，页面使用相同来源的 API。会话、消息和任务记录保存在 `.rab/state.json`，设备身份和 Agent 回执分别在 `.rab/agent-identity.json`、`.rab/agent-task-receipts.json`。两端默认共用工作区根目录下的 `.rab/`，可以用 `RAB_DATA_DIR` 覆盖；备份应同时保留两端状态。
 
 Provider 定义默认保存在 `.rab/providers.json`，也可以在本机配置页中修改文件路径，或设置 `RAB_PROVIDERS_FILE` 环境变量覆盖。仓库提供了不含个人路径和 Token 的 `providers.example.json`。
 
-Codex Provider 使用本机已安装的 `codex exec --json`，新会话创建线程，后续消息使用 `codex exec resume` 恢复上下文；默认是 `read-only` 沙箱。配置页支持自动发现 Codex CLI，启用前请先在本机完成 Codex 登录。
+Codex 使用已安装的 `codex exec --json`，后续消息通过 `codex exec resume` 恢复上下文，默认请求 `read-only` 沙箱。配置页支持自动发现；启用前需在本机完成登录并验证版本兼容性。Codex 与 WorkBuddy 都不再接受 `.cmd` / `.bat` 转发器，改选直接可执行文件或实际 Node 入口。
 
-每个任务受两个独立时钟约束：总时长默认 15 分钟（`timeout_ms` 或 `RAB_TASK_TIMEOUT_MS` 覆盖，上限 2 小时），连续 10 分钟没有任何输出则判定为挂起（`idle_timeout_ms` 或 `RAB_IDLE_TIMEOUT_MS` 覆盖）。超时和取消都会终止整棵 Provider 进程树，不会留下继续运行的无头 CLI 进程；这很重要，因为 Agent 一次只执行一个任务，残留进程会和下一个任务重叠。
+## 任务状态与恢复
 
-任务结束后，手机上除了 Agent 自己的总结，还可以展开**「做了什么」**：实际执行的命令、每条的退出码，以及 CLI 报出的配置问题。这些以前只存在于原始输出里——手机只看到一句"已完成"，看不到过程。失败的任务同样带着这份记录，因为"它失败前试了什么"往往比失败原因本身更有用。
+- Gateway 先保存任务，再派发。保留窗口内，同账号以相同 `task_id` 和相同内容重试只会查询原任务；新格式中同编号不同内容会返回冲突。任务留存约 24 小时、最多接收 200 条未清理记录；达到上限时拒绝新任务，不提前挤掉旧记录。
+- 手机刷新后从服务端恢复消息、待确认、排队、执行和终态。提交回执丢失时，可以先查记录，或在同一标签页显式使用原编号重试；页面不自动重发。
+- 两端升级后，排队任务可取消，执行中的任务先显示「等待确认」。停止不可证实时显示「结果未知」并暂停队列；取消不回滚已发生的操作。断线对账只回放回执，不自动重发执行指令。
+- 从会话准备开始计算总时长（默认 15 分钟，上限 2 小时）与静默预算（默认 10 分钟），分别支持 `timeout_ms` / `RAB_TASK_TIMEOUT_MS` 和 `idle_timeout_ms` / `RAB_IDLE_TIMEOUT_MS`。Codex 等能提供动作记录的执行器会显示「执行记录」；没有轨迹并不等于什么都没做。
 
-## 开发
+## 本机上手
+
+使用 Node.js 22 或 24 和 pnpm。在项目根目录安装依赖后，Windows 上运行 `pnpm setup`，启动后台进程并打开配置页。生成配对码，打开本机工作台，注册或登录、输入配对码；看到「电脑在线」后新建 Local 会话并发送「现在几点」。已有安装请先阅读 [升级步骤](docs/operations.md#升级与回退)，不要在任务执行中重启。
 
 ```bash
 pnpm install
-pnpm dev
+pnpm setup
 ```
 
 Windows 后台启动/关闭：
 
 ```bash
-pnpm start     # 启动（会先编译；已在运行则什么也不做）
+pnpm start     # 编译并启动
 pnpm status    # 看 Gateway / Agent 是否在线
 pnpm restart
 pnpm stop
 pnpm setup     # 启动服务并打开配置页（自动带 setup token）
 ```
 
-**没有托盘图标，也没有常驻的控制窗口。** 早先版本用一个现场编译的 C# 小程序做托盘开关，已经删掉，原因有两条，都很实在：
-
-- 在这台机器上系统**从没登记过那个图标**（`Shell_NotifyIcon` 静默失败，`HKCU\Control Panel\NotifyIconSettings` 里没有对应条目），所以它永远不会出现——一个看不见的开关比没有开关更糟。
-- 一个**未签名的 exe** 每次运行都会弹「无法验证发布者」。要消掉它得买代码签名证书，为一个开关不值得。
-
-所以控制入口就是上面几条命令。**服务不会自己启动**——开机自启需要你自己加一个启动项；不做成默认行为，是因为"不在你不知情的时候跑"比"方便"更重要。
-
-配置页面是 `http://127.0.0.1:8787/setup`，但它调用的 `/api/setup/*` 需要本机 setup token，所以**用 `pnpm setup` 打开**——如果服务没在跑，它会先启动服务再开浏览器，并自动带上 `?token=...`；直接在浏览器里手输这个网址只能看到页面框架，接口会返回 `setup_token_required`。页面里可以选择樱花内网/虚拟局域网模式、保存端口、手机访问地址、电脑名称、Provider 文件路径和重新生成配对码。后台进程状态和日志保存在 `.rab/`，停止命令只处理本项目启动并记录的 Gateway/Agent 进程。
+没有托盘图标或默认开机自启。正在开发时可用 `pnpm dev` 前台启动，不要与后台实例共用数据目录。配置页面调用的 `/api/setup/*` 要求本机 setup token，优先用 `pnpm setup` 打开，不转发含 token 的地址。当前 Windows 启动器以默认端口和数据目录为基线；非默认部署的注意事项见运维手册。
 
 本机页面：`http://127.0.0.1:8787/`；健康检查：`GET http://127.0.0.1:8787/health`
 
@@ -60,7 +58,7 @@ curl -X POST http://127.0.0.1:8787/api/tasks \
 
 ## 测试
 
-关键链路有自动化回归测试：配对与设备绑定、未绑定 Agent 收不到任何数据、任务事件属主隔离、任务提交幂等、任务记录跨重启、登录与配对限流、任务闭环，以及 Agent 侧的任务超时与进程树终止（含前端内联脚本的语法校验）。共 53 个用例。
+自动化覆盖配对与设备归属、旧凭据迁移、任务确认、同编号提交、写入故障、取消、断线对账、只读工作区和受管进程树清理。
 
 ```bash
 npm test
@@ -73,7 +71,7 @@ node node_modules/typescript/bin/tsc --build --pretty false
 node --test "apps/gateway/tests/*.test.mjs" "apps/web/tests/*.test.mjs" "services/agent/tests/*.test.mjs"
 ```
 
-CI 配置在 `.github/workflows/ci.yml`，跑的就是上面这条 `pnpm test`，没有任何 CI 专属步骤。矩阵覆盖 ubuntu 与 windows、Node 22 与 24：Windows 走 `taskkill /T /F`，Linux 走进程组信号，两条进程终止路径只能在各自的平台上验证。
+CI 配置为 Windows / Ubuntu 与 Node 22 / 24 矩阵。Windows 走 `taskkill /T /F`，Linux 走进程组信号，两种进程清理需要分别验收。
 
 Gateway 的用例会各自启动一个真实的 Gateway 子进程：端口自动选空闲端口，数据目录指向系统临时目录（不会读写 `.rab/`，可以和安全运行中的实例共存）。Agent 侧的用例则真实启动子进程树，用来验证超时与取消是否真的把整棵树杀掉。
 
@@ -83,4 +81,6 @@ Gateway 的用例会各自启动一个真实的 Gateway 子进程：端口自动
 node apps/gateway/tests/live-smoke.mjs
 ```
 
-安全说明：这是自托管测试版。`/agent` WebSocket 端点强制握手，连接必须出示设备 Token，或证明自己运行在本机，否则立即断开；只有已绑定（配对成功）的设备才会收到任务和会话命令。**回环来源不等于本机**——隧道客户端都是从 `127.0.0.1` 转发进来的，所以 `/api/setup/*` 在回环之外还要求 setup token（`.rab/setup-token`，请求头 `x-rab-setup-token`），只有能读到本机数据目录的进程才拿得到；配对码也只会签发给已认证或已证明本机的连接。用户会话 Token 只保存哈希，登录接口按 IP 限流（5 次失败锁定 10 分钟），配对码 60 秒有效、一次性并受失败限流保护；任务事件只有创建者可读；浏览器 Origin 和 WebSocket Origin 也会校验，樱花模式强制使用 HTTPS 公网地址，所有响应带基础安全头（CSP/nosniff/frame-deny）。仍未实现 MFA、数据库级加密和完整生产级审计。请只在你自己控制的局域网、虚拟局域网或可信隧道中使用，不要直接把端口暴露到公网。
+另有独立的 Chromium 手机尺寸回归 `node apps/web/tests/browser-smoke.mjs`，需要 Playwright 和 Chromium，配置见运维手册。模拟视口不代替真实 iOS / Android 验收。
+
+**安全边界：** 仅绑定且认证的设备能接任务，聊天与任务按账号隔离。管理接口同时要求回环来源及 setup token；设备通过 Ed25519 一次性挑战认证。配对码 60 秒有效，命中风险规则的任务需要另行确认，关键词规则不是安全边界。当前没有服务端注销、MFA、完整审计或公网发布验收，不要把 Gateway 直接暴露到公网。

@@ -15,19 +15,10 @@ const { isProcessAlive } = await import('../dist/process-control.js');
 const tmp = mkdtempSync(join(tmpdir(), 'rab-codex-adapter-'));
 const isWindows = process.platform === 'win32';
 
-/**
- * The CLI is reached the way Codex is really installed on Windows: through a
- * `.cmd` shim that `cmd.exe` runs, which then starts the actual node process.
- * Testing against the bare `.js` would skip the launcher layer that the
- * process-tree fix exists for.
- */
 function installCli(name, source) {
   const script = join(tmp, `${name}.js`);
   writeFileSync(script, source, 'utf8');
-  if (!isWindows) return script;
-  const shim = join(tmp, `${name}.cmd`);
-  writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`, 'utf8');
-  return shim;
+  return script;
 }
 
 /** A well-behaved CLI: emits the JSON shape the adapter parses, then exits 0. */
@@ -51,14 +42,14 @@ const failCli = installCli('fake-codex-fail', [
 /**
  * A CLI that looks alive once and then goes silent forever, while a grandchild
  * process — standing in for the real Codex process behind the launcher — keeps
- * running. The last argument is the task text, which the adapter forwards
- * verbatim, so it doubles as the path to write both PIDs to: the test needs
+ * running. The task text is forwarded via stdin, so it doubles as the path
+ * to write both PIDs to: the test needs
  * them to guarantee it can clean up even when the assertion is about to fail.
  */
 const hangCli = installCli('fake-codex-hang', [
   "const { spawn } = require('node:child_process');",
   "const { writeFileSync } = require('node:fs');",
-  'const pidFile = process.argv[process.argv.length - 1];',
+  "const pidFile = require('node:fs').readFileSync(0, 'utf8');",
   "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
   'writeFileSync(pidFile, JSON.stringify({ self: process.pid, grandchild: child.pid }));',
   "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-hang' }));",
@@ -192,11 +183,14 @@ test('a silent CLI is ended by the idle budget and its process tree is killed', 
   } finally {
     // The grandchild is what actually does the work, so it is what must be gone.
     const pids = await waitForPids(pidFile);
-    assert.ok(isProcessAlive(pids.grandchild), 'the fake Codex process should have started');
-    await adapter.cancelTask('task-hang');
-    outcome = { pids, grandchildGone: await waitForDeath(pids.grandchild) };
-    forceKill(pids.grandchild);
-    forceKill(pids.self);
+    try {
+      assert.ok(isProcessAlive(pids.grandchild), 'the fake Codex process should have started');
+      assert.equal(await adapter.cancelTask('task-hang'), 'stopped');
+      outcome = { pids, grandchildGone: await waitForDeath(pids.grandchild) };
+    } finally {
+      forceKill(pids.grandchild);
+      forceKill(pids.self);
+    }
   }
 
   assert.equal(caught?.kind, 'task_idle_timeout', `expected an idle timeout, got ${caught}`);
@@ -205,5 +199,29 @@ test('a silent CLI is ended by the idle budget and its process tree is killed', 
 
 test('cancelTask on an unknown task is a no-op', async () => {
   const adapter = codexAdapter(okCli, 'codex-idle');
-  await adapter.cancelTask('never-started');
+  assert.equal(await adapter.cancelTask('never-started'), 'not_found');
+});
+
+test('keeps prompt text out of CLI options and pins the sandbox on resume', async () => {
+  const cli = installCli('fake-codex-args', [
+    "const prompt = require('node:fs').readFileSync(0, 'utf8');",
+    "console.log(JSON.stringify({ type: 'thread.started', thread_id: 'thread-args' }));",
+    "console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ args: process.argv.slice(2), prompt }) } }));",
+  ].join('\n'));
+  const adapter = codexAdapter(cli, 'codex-args');
+  const text = '文字、双引号和换行："ab"\n下一行';
+  const input = { taskId: 'task-args', sessionId: 'session-args', text, mode: 'isolated', timeoutMs: 30_000 };
+  const first = JSON.parse((await adapter.sendMessage(input)).message);
+  assert.equal(first.prompt, text);
+  assert.ok(first.args.includes('read-only'));
+  assert.deepEqual(first.args.slice(-2), ['--', '-']);
+  const resumed = JSON.parse((await adapter.sendMessage({ ...input, taskId: 'task-args-2' })).message);
+  assert.equal(resumed.prompt, text);
+  assert.ok(resumed.args.includes('sandbox_mode="read-only"'));
+  assert.deepEqual(resumed.args.slice(-3), ['--', 'thread-args', '-']);
+});
+
+test('does not start a shell wrapper to forward user input', { skip: !isWindows }, async () => {
+  const adapter = codexAdapter(join(tmp, 'disabled-wrapper.cmd'), 'codex-wrapper');
+  await assert.rejects(adapter.sendMessage({ taskId: 'task-wrapper', sessionId: 'session-wrapper', text: '查看文件', mode: 'isolated', timeoutMs: 30_000 }), /cli_shell_wrapper_unsupported/);
 });

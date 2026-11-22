@@ -76,7 +76,7 @@ describe('pairing and task loop', () => {
       const response = await api(gateway.base, `/api/tasks/${taskId}/events`, { token: ownerToken });
       return response.data?.some(event => event.state === 'succeeded') ? response.data : undefined;
     }, 10_000);
-    assert.deepEqual(events.map(event => event.state), ['queued', 'running', 'succeeded']);
+    assert.deepEqual(events.map(event => event.state), ['dispatch_pending', 'queued', 'running', 'succeeded']);
 
     const messages = await api(gateway.base, `/api/sessions/${sessionId}/messages`, { token: ownerToken });
     assert.equal(messages.data.length, 2);

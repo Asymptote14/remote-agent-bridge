@@ -1,6 +1,20 @@
-export type TaskState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type TaskState = 'awaiting_confirmation' | 'dispatch_pending' | 'queued' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled' | 'outcome_unknown';
+export const TASK_RECEIPTS = 'task_receipts_v1';
+export const MAX_ACTIVE_TASKS = 21;
+export const MAX_TRACKED_TASKS = 200;
+export const TASK_RETENTION_MS = 24 * 60 * 60_000;
+export const TASK_QUEUE_TTL_MS = 30 * 60_000;
+export const terminalTaskState = (state: TaskState | undefined) => state === 'succeeded' || state === 'failed' || state === 'cancelled' || state === 'outcome_unknown';
 export type InteractionMode = 'isolated' | 'isolated-gui' | 'foreground';
 export type TaskKind = 'browser' | 'file' | 'process' | 'screenshot' | 'shell' | 'gui';
+/**
+ * How dangerous the Gateway judged a task to be from its text.
+ *
+ * `high` tasks are not dispatched at all until the phone confirms them, which
+ * keeps an irreversible action (delete, format, shutdown, remote code) from
+ * being one mistyped sentence away from happening unattended.
+ */
+export type TaskRisk = 'low' | 'high';
 
 export type Envelope<T = unknown> = {
   version: 1;
@@ -25,11 +39,44 @@ export type TaskCreate = {
   idle_timeout_ms?: number;
   history?: ConversationMessage[];
 };
+export type TaskRef = { task_id: string; dispatch_id: string };
+export type TaskDispatch = TaskCreate & TaskRef & { queue_expires_at: number };
+export type AgentReady = { device_id: string; binding_id?: string; tasks: Array<TaskRef & { cancel_requested: boolean }> };
+export type TaskAck = TaskRef & { sequence: number };
 export type ConversationMessage = {
   id: string;
+  task_id?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   created_at: string;
+};
+/**
+ * Gateway → Agent: the nonce this connection must sign.
+ *
+ * A fresh nonce per connection is what makes the device signature
+ * un-replayable: a signature captured from one connection is useless on the
+ * next one, even though the device key itself never changes.
+ */
+export type ServerHello = { nonce: string; expires_at: number };
+
+/** Agent → Gateway: who this device claims to be, and proof of that claim. */
+export type AgentHello = {
+  device_id: string;
+  platform: string;
+  interaction_mode: string;
+  capabilities: string[];
+  providers?: AgentProviderInfo[];
+  /** Base64 (SPKI DER) Ed25519 public key. The Gateway stores only this half. */
+  public_key?: string;
+  /** Base64 Ed25519 signature over the Gateway's nonce. */
+  signature?: string;
+  /**
+   * Legacy bearer token. Only accepted to migrate a device that was bound
+   * before device keys existed; a key-bound device is never sent one again.
+   */
+  device_token?: string;
+  /** Proves the peer can read this machine's data directory. */
+  local_proof?: string;
 };
 export type AgentProviderInfo = {
   id: string;
@@ -77,7 +124,12 @@ export type TaskEvent = {
   session_id?: string;
   /** What was done, carried on the terminal event. */
   actions?: TaskAction[];
+  /** Set on the `awaiting_confirmation` event so the phone can show why. */
+  risk?: TaskRisk;
+  reasons?: string[];
 };
+
+export type TaskReport = TaskEvent & { dispatch_id?: string; sequence?: number };
 
 export function envelope<T>(type: string, payload: T, requestId: string = crypto.randomUUID()): Envelope<T> {
   return { version: 1, type, request_id: requestId, payload };
